@@ -240,6 +240,11 @@ struct ContentView: View {
     private var debugLogSection: some View {
         DisclosureGroup("实时协议日志（\(bt.logs.count)）", isExpanded: $showDebugLogs) {
             VStack(alignment: .leading, spacing: 8) {
+                Text("共享容器：\(SharedBatteryStore.shared.resolvedAppGroupID ?? "未检测到 AppGroup")")
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+
                 if let raw = bt.latestSnapshot?.rawHex {
                     Text("最新原始 Hex：\(raw)")
                         .font(.system(.caption2, design: .monospaced))
