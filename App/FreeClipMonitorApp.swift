@@ -12,6 +12,7 @@ struct FreeClipMonitorApp: App {
                 .task {
                     _ = await BatteryNotificationManager.shared.requestAuthorization()
                     FreeClipShortcutsProvider.updateAppShortcutParameters()
+                    btManager.startForegroundScanning()
                 }
         }
         .onChange(of: scenePhase) { _, newPhase in

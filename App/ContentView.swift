@@ -4,6 +4,7 @@ import CoreBluetooth
 struct ContentView: View {
     @EnvironmentObject private var bt: FreeClipBluetoothManager
     @State private var isManualScanning = false
+    @State private var scanFeedback: String? = nil
     @State private var showDebugLogs = false
 
     var body: some View {
@@ -140,13 +141,22 @@ struct ContentView: View {
             Button {
                 guard !isManualScanning else { return }
                 isManualScanning = true
+                scanFeedback = "正在扫描蓝牙广播（最多 4.5 秒）..."
                 Task {
-                    _ = await bt.performOneShotScan(
+                    let before = bt.latestSnapshot?.timestamp
+                    let snap = await bt.performOneShotScan(
                         timeoutSeconds: 4.5,
                         isForeground: true,
                         notifyAlways: true,
                         reason: "手动扫描测试"
                     )
+                    if let snap, snap.timestamp != before {
+                        scanFeedback = "✅ 扫描成功：\(snap.summaryLine)（已推送通知）"
+                    } else if let snap {
+                        scanFeedback = "⚠️ 本次未抓到新广播，已推送最近缓存：\(snap.summaryLine)"
+                    } else {
+                        scanFeedback = "⚠️ 4.5 秒内未扫到 FreeClip 2，请确认耳机盒在附近并点开下方协议日志"
+                    }
                     isManualScanning = false
                 }
             } label: {
@@ -166,6 +176,14 @@ struct ContentView: View {
             .buttonStyle(.borderedProminent)
             .tint(.blue)
             .clipShape(RoundedRectangle(cornerRadius: 14))
+
+            if let feedback = scanFeedback {
+                Text(feedback)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 4)
+            }
         }
     }
 

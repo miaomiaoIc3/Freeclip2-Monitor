@@ -1,9 +1,23 @@
 import Foundation
 import UserNotifications
 
-final class BatteryNotificationManager {
+final class BatteryNotificationManager: NSObject, UNUserNotificationCenterDelegate {
     static let shared = BatteryNotificationManager()
     private var lastNotificationSentAt: Date?
+
+    private override init() {
+        super.init()
+        UNUserNotificationCenter.current().delegate = self
+    }
+
+    /// 关键：让 App 处于前台时也能弹出系统横幅与提示音（否则 iOS 默认静默吞掉前台通知）
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .list, .sound])
+    }
 
     func requestAuthorization() async -> Bool {
         do {

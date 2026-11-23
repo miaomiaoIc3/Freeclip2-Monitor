@@ -1,0 +1,6 @@
+dist/
+tools/
+build/
+Payload/
+*.ipa
+*.xcodeproj

@@ -299,15 +299,20 @@ extension FreeClipBluetoothManager: CBCentralManagerDelegate {
             let fdeeData = serviceData?[self.fdeeUUID]
 
             // 1. 优先解析 FDEE 状态电量广播（无须建立 GATT 连接即可秒出真实三电量）
-            if let fdeeData, let snapshot = FreeClipProtocol.parseFDEE(fdeeData) {
-                self.discoveredDeviceName = name ?? "HUAWEI FreeClip 2"
-                if self.settings.savedPeripheralUUID != peripheral.identifier.uuidString {
-                    var updated = self.settings
-                    updated.savedPeripheralUUID = peripheral.identifier.uuidString
-                    self.updateSettings(updated)
+            if let fdeeData {
+                if let snapshot = FreeClipProtocol.parseFDEE(fdeeData) {
+                    self.discoveredDeviceName = name ?? "HUAWEI FreeClip 2"
+                    if self.settings.savedPeripheralUUID != peripheral.identifier.uuidString {
+                        var updated = self.settings
+                        updated.savedPeripheralUUID = peripheral.identifier.uuidString
+                        self.updateSettings(updated)
+                    }
+                    self.acceptSnapshot(snapshot)
+                    return
+                } else if isFreeClipByName {
+                    self.discoveredDeviceName = name
+                    self.log("收到 FreeClip 非电量 FDEE 帧: \(fdeeData.hexString)")
                 }
-                self.acceptSnapshot(snapshot)
-                return
             }
 
             // 2. 如果是 FreeClip 2 的可连接发现帧（00100001...），顺带记住 UUID 并尝试挂接 FD21
