@@ -23,6 +23,9 @@ targets:
       - path: Shared
     entitlements:
       path: App/FreeClipMonitor.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.freeclip.monitor
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.freeclip.monitor
@@ -56,6 +59,9 @@ targets:
       - path: Shared
     entitlements:
       path: Widget/FreeClipMonitorWidget.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.freeclip.monitor
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.freeclip.monitor.widget
