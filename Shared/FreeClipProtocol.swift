@@ -40,9 +40,12 @@ struct FreeClipSnapshot: Codable, Equatable {
     let timestamp: Date
     let rawHex: String
 
-    /// 摘要文案（用于通知与小组件）
+    /// 摘要文案（用于通知与快捷指令返回值）
     var summaryLine: String {
-        "充电盒 \(caseBattery.displayText) · 耳机 \(earbud1.displayText) / \(earbud2.displayText)"
+        let caseText = (caseBattery.isCharging && (caseBattery.level ?? 100) < 100)
+            ? "\(caseBattery.shortPercent)⚡"
+            : caseBattery.shortPercent
+        return "充电盒 \(caseText) · 左耳 \(earbud1.shortPercent) · 右耳 \(earbud2.shortPercent)"
     }
 
     /// 电量、充电或盒盖状态是否相对上次有实质变化

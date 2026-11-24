@@ -62,14 +62,12 @@ final class BatteryNotificationManager: NSObject, UNUserNotificationCenterDelega
         }
 
         let content = UNMutableNotificationContent()
-        if snapshot.isCaseLow(threshold: settings.lowBatteryThreshold),
-           let caseLvl = snapshot.caseBattery.level {
-            content.title = "FreeClip 2 电量偏低"
-            content.body = "充电盒 \(caseLvl)%，耳机 \(snapshot.earbud1.shortPercent) / \(snapshot.earbud2.shortPercent)"
+        if snapshot.isCaseLow(threshold: settings.lowBatteryThreshold) {
+            content.title = "FreeClip 2 · 电量偏低"
         } else {
             content.title = "FreeClip 2"
-            content.body = snapshot.summaryLine
         }
+        content.body = snapshot.summaryLine
         content.sound = .default
 
         let result = await deliver(content: content, idPrefix: "freeclip-battery")
@@ -82,8 +80,8 @@ final class BatteryNotificationManager: NSObject, UNUserNotificationCenterDelega
     @discardableResult
     func sendFullChargeNotice(_ snapshot: FreeClipSnapshot) async -> NotificationDeliveryResult {
         let content = UNMutableNotificationContent()
-        content.title = "FreeClip 2 已充满"
-        content.body = "充电盒电量 100%"
+        content.title = "FreeClip 2 · 已充满"
+        content.body = snapshot.summaryLine
         content.sound = .default
         return await deliver(content: content, idPrefix: "freeclip-full")
     }
@@ -91,9 +89,8 @@ final class BatteryNotificationManager: NSObject, UNUserNotificationCenterDelega
     @discardableResult
     func sendLowBatteryNotice(_ snapshot: FreeClipSnapshot) async -> NotificationDeliveryResult {
         let content = UNMutableNotificationContent()
-        content.title = "FreeClip 2 电量偏低"
-        let caseText = snapshot.caseBattery.shortPercent
-        content.body = "充电盒仅剩 \(caseText)，请及时充电"
+        content.title = "FreeClip 2 · 电量偏低"
+        content.body = snapshot.summaryLine
         content.sound = .default
         return await deliver(content: content, idPrefix: "freeclip-low")
     }
@@ -102,13 +99,7 @@ final class BatteryNotificationManager: NSObject, UNUserNotificationCenterDelega
     func sendScanFallbackNotice(cached: FreeClipSnapshot?) async -> NotificationDeliveryResult {
         let content = UNMutableNotificationContent()
         content.title = "FreeClip 2"
-        if let cached {
-            let fmt = DateFormatter()
-            fmt.dateFormat = "HH:mm"
-            content.body = "\(cached.summaryLine)（\(fmt.string(from: cached.timestamp))）"
-        } else {
-            content.body = "未发现附近设备"
-        }
+        content.body = cached?.summaryLine ?? "充电盒 -- · 左耳 -- · 右耳 --"
         content.sound = .default
         return await deliver(content: content, idPrefix: "freeclip-fallback")
     }
