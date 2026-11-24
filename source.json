@@ -4,6 +4,7 @@
   "subtitle": "FreeClip 2 iOS 电量工具",
   "description": "面向 iPhone 用户的华为 FreeClip 2 电量查看与桌面小组件。",
   "iconURL": "https://raw.githubusercontent.com/miaomiaoIc3/Freeclip2-Monitor/main/App/Assets.xcassets/AppIcon.appiconset/AppIcon.png",
+  "headerURL": "https://raw.githubusercontent.com/miaomiaoIc3/Freeclip2-Monitor/main/docs/preview.png",
   "website": "https://github.com/miaomiaoIc3/Freeclip2-Monitor",
   "tintColor": "#30D158",
   "apps": [
