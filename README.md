@@ -1,56 +1,74 @@
-# FreeClipMonitor（iPhone 原生华为 FreeClip 2 真实电量监测 App）
+# FreeClip 2 Monitor
 
-一款专为 **iPhone + 华为 FreeClip 2** 开发的原生 SwiftUI + CoreBluetooth 工具：直接解析硬件蓝牙真实电量，**无需手动校准、无需估算**，支持**每次蓝牙断开自动扫描并推送真实三电量**、**充满 100% 自动识别**、**桌面与锁屏小组件**。
+在 iPhone 上用华为 FreeClip 2 时，系统自带的电池组件看不到充电盒电量，官方 App 又需要每次手动打开。这个项目是写给自己的小工具，用来直接通过蓝牙读取充电盒和双耳电量，并同步到桌面小组件和系统通知里。
 
----
+目前处于 `v0.9.0` 公开测试阶段，仍在持续维护，遇到问题欢迎提 Issue。
 
-## 核心协议原理（已真机抓包实测验证）
+## 功能
 
-1. **主通道：`FDEE` BLE 实时广播（支持开盖、合盖、插线充电状态！）**
-   - 报文头：`01 02 <lid> FF ... 00 00 01 67 01 03 ... [充电盒] [耳机1] [耳机2]`
-   - `lid`：`03` = 开盖，`00` = 合盖
-   - 电量解码：`byte & 0x7F` 为真实百分比（0~100），`(byte & 0x80) != 0` 为充电状态
-   - **实测已确认**：即便耳机放回盒内**合盖**或**合盖插线充电**，FreeClip 2 依然持续广播 `FDEE` 真实电量，充满 100% 时可直接扫描识别。
-2. **辅通道：`0xFD21` GATT 串口透传**
-   - Notify 特征值：`02000200-0000-2000-8000-009E78563412`
-   - Write 特征值：`03000300-0000-3000-8000-009E78563412`
-   - 查电量指令帧：`5A0003000108DF73`（`01 08` + CRC16-XMODEM）
+- 读取充电盒与左右耳电量，开盖、合盖、插线充电状态均可获取
+- 桌面小组件（小号 / 中号）与锁屏小组件
+- 蓝牙断开推送电量、充电盒低电量提醒、充满 100% 提醒
+- 提供快捷指令动作，可搭配 iOS 自动化使用
 
----
+## 安装方式
 
-## Windows 电脑免 Mac 编译 & 安装到 iPhone（约 5 分钟）
+需要 **iOS 17.0 及以上**。App 未上架 App Store，目前提供以下两种安装途径：
 
-### 第 1 步：用 GitHub Actions 免费云端编译 `.ipa`
-1. 在 GitHub 上新建一个仓库（公开或私有均可，例如 `FreeClipMonitor`）。
-2. 把本目录（`C:\Users\Administrator\.gemini\antigravity\scratch\FreeClipMonitor`）的所有文件推送到该仓库的 `main` 分支：
-   ```powershell
-   cd C:\Users\Administrator\.gemini\antigravity\scratch\FreeClipMonitor
-   git init -b main
-   git add .
-   git commit -m "Initial FreeClipMonitor iOS app"
-   git remote add origin https://github.com/<你的用户名>/FreeClipMonitor.git
-   git push -u origin main
-   ```
-3. 打开 GitHub 仓库页面 → 点击顶部 **Actions** → 等待 `Build FreeClipMonitor IPA` 运行变绿（约 2～3 分钟）→ 在页面底部的 **Artifacts** 中下载 **`FreeClipMonitor-IPA`**，解压得到 **`FreeClipMonitor.ipa`**。
+### 方式一：通过软件源安装（推荐，支持后续一键更新）
 
-### 第 2 步：在 Windows 上将 `.ipa` 安装到 iPhone
-任选以下两种免费自签工具之一（使用自己的普通 Apple ID 即可，无需 \$99 开发者账号）：
-* **推荐：SideStore**（[sidestore.io](https://sidestore.io)）  
-  首次通过 Windows 电脑装一次 SideStore 到 iPhone 后，以后直接在 iPhone 上导入 `FreeClipMonitor.ipa`，并在手机上本地自动续签，**再也不用连电脑**。
-* **备选：Sideloadly**（[sideloadly.io](https://sideloadly.io)）  
-  Windows 打开 Sideloadly，插上 iPhone，把 `FreeClipMonitor.ipa` 拖进去输入 Apple ID 即可安装（免费 Apple ID 每 7 天需连一次电脑或同 Wi-Fi 自动续签）。
+适用于 **SideStore**、**AltStore**、**Feather** 等支持 AltStore 源格式的签名工具。
 
-> 安装后如提示“未受信任的开发者”，在 iPhone `设置 → 通用 → VPN与设备管理` 中点击信任即可打开 App。
+- **软件源地址**（在 SideStore / AltStore 的「源 / Sources」页点右上角 `+` 粘贴即可）：
+  ```
+  https://raw.githubusercontent.com/miaomiaoIc3/Freeclip2-Monitor/main/source.json
+  ```
 
----
+> 安装提示：
+> 1. 弹出是否保留 **App Extensions** 时务必选择**保留**，否则桌面小组件无法正常显示。
+> 2. 如果之前没装过 SideStore，首次配置 SideStore 需要连一次电脑；装好后日常更新和续签都可以在手机上完成。
 
-### 第 3 步：配置“每次蓝牙断开自动扫描并推送真实电量”
+### 方式二：直接下载 `.ipa` 安装
 
-打开 App 授予 **蓝牙权限** 与 **通知权限** 后，在 iPhone 的 **「快捷指令」** App 里配 1 条自动化：
+如果你已经有个人开发者 UDID 证书（轻松签 / Feather），或者使用 TrollStore、Sideloadly，可以直接在 [Releases 页面](https://github.com/miaomiaoIc3/Freeclip2-Monitor/releases/latest) 下载 `FreeClipMonitor-v0.9.0.ipa` 进行安装。
 
-1. 打开「快捷指令」→ 底部 **「自动化」** → 右上角 **`+`** → 选择 **「蓝牙」**。
-2. 设备选择 **HUAWEI FreeClip 2** → 勾选 **「已断开连接」** → 选择 **「立即运行」**。
-3. 新建空白自动化 → 搜索并选择本 App 提供的动作：
-   * **`扫描 FreeClip 2 真实电量并推送`**（推荐，100% 稳定捕获合盖后的 `FDEE` 真实广播，扫描 1~2 秒后立刻推送三项真实电量通知并刷新桌面小组件）。
-   * *（也可尝试同 App 提供的 **`后台静默扫描 FreeClip 2 电量`**，不弹界面在后台通过 `FD21` / `FDEE` 尝试读取）*。
-4. 桌面或锁屏长按空白处 → **`+`** → 搜索 **FreeClip 2**，即可添加桌面小组件（小号 / 中号）和锁屏小组件。
+## 快捷指令配置
+
+安装完成后，先打开一次 App 并授予**蓝牙**和**通知**权限。
+
+### 1. 耳机断开时自动推送电量
+
+打开 iPhone「快捷指令」→ 底部「自动化」→ 右上角 `+`：
+
+1. 触发条件选 **蓝牙** → 设备选 **HUAWEI FreeClip 2** → 勾选 **已断开连接** → 选 **立即运行**。
+2. 动作搜索本 App 提供的 **获取 FreeClip 2 电量**（如需不弹界面静默尝试，可选 **后台获取 FreeClip 2 电量**）。
+
+### 2. SideStore 定时自动续签（可选）
+
+使用免费 Apple ID 签名每 7 天需要续签一次，可以用快捷指令自动化省去手动操作：
+
+1. 新建一条每天固定时间（建议在晚上连着 Wi-Fi 时）的自动化，选 **立即运行**。
+2. 按顺序添加动作：
+   - 设置 VPN → 连接 `LocalDevVPN`
+   - 等待 `3` 秒
+   - SideStore → `Refresh All Apps`（关闭「运行时显示」）
+   - 设置 VPN → 断开 `LocalDevVPN`（如果平时常挂其他代理，可在最后一步切回）
+
+## 兼容说明与协议记录
+
+目前仅在 **HUAWEI FreeClip 2** 上真机验证过。
+
+App 通过两个通道读取电量：
+- **BLE 广播 (`FDEE`)**：解析 `01 02 <lid> FF ... 00 00 01 67 01 03 ... [盒] [耳1] [耳2]`，低 7 位为电量百分比，最高位为充电状态。
+- **GATT 服务 (`FD21`)**：向特征值发送查电量帧 `5A0003000108DF73`，解析返回报文中的三路电量。
+
+如果你用的是 FreeClip 一代或其他华为耳机，可以用 LightBlue 抓一下广播里的 `FDEE` 数据并提交到 Issue，后续可以一起适配。
+
+## 自行构建
+
+仓库配置了 GitHub Actions（`.github/workflows/build-ipa.yml`），Fork 后无需 Mac，推送代码即可在云端自动编译并打包 `.ipa`。
+
+## 说明
+
+- 纯本地蓝牙通信，不联网，不收集任何个人数据。
+- 本项目为个人开源工具（by Happenstance），与华为无任何官方关联。
