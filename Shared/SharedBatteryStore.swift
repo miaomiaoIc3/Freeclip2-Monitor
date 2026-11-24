@@ -1,8 +1,9 @@
 import Foundation
 import WidgetKit
 
-/// 主 App 与桌面/锁屏小组件共享的本地存储：
-/// 自动从已签名的 embedded.mobileprovision 解析真实 App Group ID（完美兼容 SideStore/AltStore 自动追加 TeamID 后缀！）
+/// 主 App 与桌面/锁屏小组件共享的本地存储。
+/// 自动从已签名的 embedded.mobileprovision / ALTAppGroups 解析实际生效的 App Group ID，
+/// 兼容 SideStore / AltStore 重签时附加个人 TeamID 后缀的场景。
 final class SharedBatteryStore {
     static let shared = SharedBatteryStore()
 
@@ -12,14 +13,24 @@ final class SharedBatteryStore {
     private let logsKey = "freeclip_debug_logs_v1"
     private let snapshotFilename = "freeclip_latest_snapshot_v1.json"
 
-    /// 动态解析出的真实可用 App Group ID（例如 group.com.freeclip.monitor.GTQZ3P9DJ3）
     let resolvedAppGroupID: String?
+    let detectionCandidates: [String]
     private let sharedContainerURL: URL?
 
+    private var lastSavedSnapshot: FreeClipSnapshot?
+    private var lastDiskWriteAt: Date?
+    private var lastWidgetReloadAt: Date?
+
     private init() {
-        let detected = Self.detectWorkingAppGroup()
-        self.resolvedAppGroupID = detected?.id
-        self.sharedContainerURL = detected?.url
+        let candidates = Self.collectAppGroupCandidates()
+        self.detectionCandidates = candidates
+        if let detected = Self.resolveWorkingAppGroup(from: candidates) {
+            self.resolvedAppGroupID = detected.id
+            self.sharedContainerURL = detected.url
+        } else {
+            self.resolvedAppGroupID = nil
+            self.sharedContainerURL = nil
+        }
     }
 
     private var defaults: UserDefaults {
@@ -29,10 +40,10 @@ final class SharedBatteryStore {
         return .standard
     }
 
-    private static func detectWorkingAppGroup() -> (id: String, url: URL)? {
+    private static func collectAppGroupCandidates() -> [String] {
         var candidates: [String] = []
 
-        // 1. 优先从签名后的 embedded.mobileprovision 提取真实授权的 App Group ID（兼容 SideStore Auto-Fix AppGroup IDs）
+        // 1. 从签名后的 embedded.mobileprovision 提取实际授权的 App Group ID
         if let provURL = Bundle.main.url(forResource: "embedded", withExtension: "mobileprovision"),
            let data = try? Data(contentsOf: provURL),
            let plistStart = data.range(of: Data("<plist".utf8)),
@@ -45,20 +56,41 @@ final class SharedBatteryStore {
             }
         }
 
-        // 2. 兜底：基于当前 Bundle ID 推导（例如 com.freeclip.monitor.TEAMID 或 .widget 后缀）
-        if let bundleID = Bundle.main.bundleIdentifier {
-            let baseID = bundleID.hasSuffix(".widget")
-                ? String(bundleID.dropLast(".widget".count))
-                : bundleID
-            candidates.append("group.\(baseID)")
+        // 2. SideStore / AltStore 会在 Info.plist 写入重签后的 ALTAppGroups
+        if let altGroups = Bundle.main.object(forInfoDictionaryKey: "ALTAppGroups") as? [String] {
+            candidates.append(contentsOf: altGroups)
         }
 
-        // 3. 默认静态 ID
+        // 3. 基于当前 Bundle ID 推导（兼容主 App 与 .widget 扩展的不同后缀顺序）
+        if let bundleID = Bundle.main.bundleIdentifier {
+            if bundleID.hasSuffix(".widget") {
+                let base = String(bundleID.dropLast(".widget".count))
+                candidates.append("group.\(base)")
+            } else if bundleID.contains(".widget.") {
+                let base = bundleID.replacingOccurrences(of: ".widget.", with: ".")
+                candidates.append("group.\(base)")
+            } else {
+                candidates.append("group.\(bundleID)")
+            }
+        }
+
+        // 4. 默认静态 ID
         candidates.append(defaultAppGroupID)
 
-        // 按顺序验证哪一个 App Group 容器真正可访问
+        var unique: [String] = []
         var seen = Set<String>()
-        for groupID in candidates where seen.insert(groupID).inserted {
+        for raw in candidates {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, !trimmed.contains("*") else { continue }
+            if seen.insert(trimmed).inserted {
+                unique.append(trimmed)
+            }
+        }
+        return unique
+    }
+
+    private static func resolveWorkingAppGroup(from candidates: [String]) -> (id: String, url: URL)? {
+        for groupID in candidates {
             if let url = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: groupID) {
                 return (groupID, url)
             }
@@ -66,17 +98,34 @@ final class SharedBatteryStore {
         return nil
     }
 
-    func saveSnapshot(_ snapshot: FreeClipSnapshot) {
-        if let data = try? JSONEncoder().encode(snapshot) {
-            // 优先写入共享容器文件（跨进程 WidgetKit 读取零缓存延迟）
+    func saveSnapshot(_ snapshot: FreeClipSnapshot, forceWidgetReload: Bool = false) {
+        let now = Date()
+        let changed = snapshot.hasSignificantChange(comparedTo: lastSavedSnapshot)
+        let shouldWriteDisk = forceWidgetReload
+            || changed
+            || lastDiskWriteAt == nil
+            || now.timeIntervalSince(lastDiskWriteAt!) >= 10
+
+        if shouldWriteDisk, let data = try? JSONEncoder().encode(snapshot) {
             if let dir = sharedContainerURL {
                 let fileURL = dir.appendingPathComponent(snapshotFilename)
                 try? data.write(to: fileURL, options: .atomic)
             }
             defaults.set(data, forKey: snapshotKey)
             UserDefaults.standard.set(data, forKey: snapshotKey)
+            lastSavedSnapshot = snapshot
+            lastDiskWriteAt = now
         }
-        WidgetCenter.shared.reloadAllTimelines()
+
+        let shouldReloadWidget = forceWidgetReload
+            || changed
+            || lastWidgetReloadAt == nil
+            || now.timeIntervalSince(lastWidgetReloadAt!) >= 60
+
+        if shouldReloadWidget {
+            lastWidgetReloadAt = now
+            WidgetCenter.shared.reloadAllTimelines()
+        }
     }
 
     func loadSnapshot() -> FreeClipSnapshot? {

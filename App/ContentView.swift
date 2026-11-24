@@ -1,11 +1,13 @@
 import SwiftUI
 import CoreBluetooth
+import UIKit
+import UserNotifications
 
 struct ContentView: View {
     @EnvironmentObject private var bt: FreeClipBluetoothManager
     @State private var isManualScanning = false
     @State private var scanFeedback: String? = nil
-    @State private var showDebugLogs = false
+    @State private var showDiagnostics = false
 
     var body: some View {
         NavigationStack {
@@ -13,31 +15,52 @@ struct ContentView: View {
                 VStack(spacing: 16) {
                     statusHeaderCard
                     batteryDashboardCard
-                    actionButtonsSection
+                    actionButtonSection
+
+                    if bt.notificationStatus == .denied {
+                        notificationPermissionBanner
+                    }
+
                     settingsSection
-                    debugLogSection
                 }
                 .padding()
             }
             .background(Color(.systemGroupedBackground))
-            .navigationTitle("FreeClip 2 电量")
+            .navigationTitle("FreeClip 2")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        if bt.isScanning {
-                            bt.stopScanning()
-                        } else {
-                            bt.startForegroundScanning()
+                    Menu {
+                        Button {
+                            if bt.isScanning {
+                                bt.stopScanning()
+                            } else {
+                                bt.startForegroundScanning()
+                            }
+                        } label: {
+                            Label(
+                                bt.isScanning ? "暂停扫描" : "继续扫描",
+                                systemImage: bt.isScanning ? "pause.circle" : "play.circle"
+                            )
+                        }
+
+                        Button {
+                            showDiagnostics = true
+                        } label: {
+                            Label("诊断信息", systemImage: "doc.text.magnifyingglass")
                         }
                     } label: {
-                        Label(bt.isScanning ? "扫描中" : "开始扫描", systemImage: bt.isScanning ? "antenna.radiowaves.left.and.right" : "play.circle")
+                        Image(systemName: "ellipsis.circle")
                     }
                 }
+            }
+            .sheet(isPresented: $showDiagnostics) {
+                DiagnosticsSheetView()
+                    .environmentObject(bt)
             }
         }
     }
 
-    // MARK: - 顶部连接与雷达状态
+    // MARK: - 设备状态
 
     private var statusHeaderCard: some View {
         HStack(spacing: 12) {
@@ -55,12 +78,13 @@ struct ContentView: View {
 
             Spacer()
 
-            if let snap = bt.latestSnapshot {
+            if let snap = bt.latestSnapshot, snap.lidState != .unknown {
                 Text(snap.lidState.rawValue)
-                    .font(.caption.bold())
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
                     .padding(.horizontal, 10)
                     .padding(.vertical, 5)
-                    .background(.ultraThinMaterial, in: Capsule())
+                    .background(Color(.tertiarySystemFill), in: Capsule())
             }
         }
         .padding()
@@ -76,18 +100,18 @@ struct ContentView: View {
 
     private var statusSubtitle: String {
         switch bt.bluetoothState {
-        case .poweredOff: return "系统蓝牙未开启"
-        case .unauthorized: return "请在系统设置中允许蓝牙权限"
+        case .poweredOff: return "蓝牙未开启"
+        case .unauthorized: return "需要蓝牙权限"
         case .poweredOn:
-            if bt.isGattConnected { return "FD21 已连接 · 实时监听中" }
-            if bt.isScanning { return "正在扫描 FDEE 实时广播（支持合盖与充电）" }
-            return "蓝牙就绪 · 扫描已暂停"
+            if bt.isGattConnected { return "已连接" }
+            if bt.isScanning { return "正在扫描" }
+            return "已暂停"
         default:
-            return "正在初始化蓝牙..."
+            return "正在初始化"
         }
     }
 
-    // MARK: - 三路真实电量仪表盘
+    // MARK: - 电量仪表盘
 
     private var batteryDashboardCard: some View {
         VStack(spacing: 16) {
@@ -116,17 +140,15 @@ struct ContentView: View {
 
             HStack {
                 if let snap = bt.latestSnapshot {
-                    Label(snap.source.rawValue, systemImage: "wave.3.right")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Spacer()
                     Text("更新于 \(formatTime(snap.timestamp))")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                    Spacer()
                 } else {
-                    Text("暂未扫到数据，请将 FreeClip 2 靠近手机（开盖或合盖均可）")
+                    Text("将耳机靠近手机以获取电量")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                    Spacer()
                 }
             }
         }
@@ -134,44 +156,50 @@ struct ContentView: View {
         .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 20))
     }
 
-    // MARK: - 快捷操作区
+    // MARK: - 刷新与通知
 
-    private var actionButtonsSection: some View {
-        VStack(spacing: 10) {
+    private var actionButtonSection: some View {
+        VStack(spacing: 8) {
             Button {
                 guard !isManualScanning else { return }
                 isManualScanning = true
-                scanFeedback = "正在扫描蓝牙广播（最多 4.5 秒）..."
+                scanFeedback = nil
                 Task {
-                    let before = bt.latestSnapshot?.timestamp
-                    let snap = await bt.performOneShotScan(
+                    let outcome = await bt.performOneShotScan(
                         timeoutSeconds: 4.5,
                         isForeground: true,
                         notifyAlways: true,
-                        reason: "手动扫描测试"
+                        reason: "手动刷新"
                     )
-                    if let snap, snap.timestamp != before {
-                        scanFeedback = "✅ 扫描成功：\(snap.summaryLine)（已推送通知）"
-                    } else if let snap {
-                        scanFeedback = "⚠️ 本次未抓到新广播，已推送最近缓存：\(snap.summaryLine)"
-                    } else {
-                        scanFeedback = "⚠️ 4.5 秒内未扫到 FreeClip 2，请确认耳机盒在附近并点开下方协议日志"
+                    switch outcome.notificationResult {
+                    case .denied:
+                        scanFeedback = "未开启通知权限，请在系统设置中允许"
+                    case .failed(let message):
+                        scanFeedback = "通知发送失败：\(message)"
+                    default:
+                        if outcome.isFresh {
+                            scanFeedback = "已更新并发送通知"
+                        } else if outcome.snapshot != nil {
+                            scanFeedback = "未检测到新广播，已发送最近记录"
+                        } else {
+                            scanFeedback = "未发现附近设备"
+                        }
                     }
                     isManualScanning = false
                 }
             } label: {
-                HStack {
+                HStack(spacing: 8) {
                     if isManualScanning {
                         ProgressView()
                             .tint(.white)
                     } else {
-                        Image(systemName: "bell.badge.fill")
+                        Image(systemName: "bell.fill")
                     }
-                    Text(isManualScanning ? "正在扫描实时电量..." : "立即扫描真实电量并推送通知")
+                    Text(isManualScanning ? "正在刷新..." : "刷新并发送通知")
                         .fontWeight(.semibold)
                 }
                 .frame(maxWidth: .infinity)
-                .padding(.vertical, 14)
+                .padding(.vertical, 13)
             }
             .buttonStyle(.borderedProminent)
             .tint(.blue)
@@ -187,15 +215,39 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - 通知策略设置
+    private var notificationPermissionBanner: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "bell.slash.fill")
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("通知权限已关闭")
+                    .font(.subheadline.weight(.medium))
+                Text("开启后可接收电量与低电提醒")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("去设置") {
+                if let url = URL(string: UIApplication.openNotificationSettingsURLString) {
+                    UIApplication.shared.open(url)
+                }
+            }
+            .font(.caption.weight(.semibold))
+            .buttonStyle(.bordered)
+        }
+        .padding()
+        .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
+    }
+
+    // MARK: - 通知设置
 
     private var settingsSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("推送策略")
-                .font(.subheadline.bold())
+            Text("通知")
+                .font(.subheadline.weight(.semibold))
                 .foregroundStyle(.secondary)
 
-            Toggle("每次断开/扫描都推送电量", isOn: Binding(
+            Toggle("断开时推送电量", isOn: Binding(
                 get: { bt.settings.notifyOnEveryScan },
                 set: { val in
                     var s = bt.settings
@@ -206,7 +258,7 @@ struct ContentView: View {
 
             Divider()
 
-            Toggle("充电盒充满 100% 时推送通知", isOn: Binding(
+            Toggle("充满提醒", isOn: Binding(
                 get: { bt.settings.notifyWhenFull },
                 set: { val in
                     var s = bt.settings
@@ -218,7 +270,7 @@ struct ContentView: View {
             Divider()
 
             Stepper(
-                "充电盒低电红字标记：≤ \(bt.settings.lowBatteryThreshold)%",
+                "低电量提醒：\(bt.settings.lowBatteryThreshold)%",
                 value: Binding(
                     get: { bt.settings.lowBatteryThreshold },
                     set: { val in
@@ -235,52 +287,14 @@ struct ContentView: View {
         .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
     }
 
-    // MARK: - 原始报文与调试日志
-
-    private var debugLogSection: some View {
-        DisclosureGroup("实时协议日志（\(bt.logs.count)）", isExpanded: $showDebugLogs) {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("共享容器：\(SharedBatteryStore.shared.resolvedAppGroupID ?? "未检测到 AppGroup")")
-                    .font(.system(.caption2, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-
-                if let raw = bt.latestSnapshot?.rawHex {
-                    Text("最新原始 Hex：\(raw)")
-                        .font(.system(.caption2, design: .monospaced))
-                        .foregroundStyle(.blue)
-                        .textSelection(.enabled)
-                }
-
-                HStack {
-                    Button("清空日志", role: .destructive) {
-                        bt.clearLogs()
-                    }
-                    .font(.caption)
-                    Spacer()
-                }
-
-                ForEach(bt.logs.prefix(20), id: \.self) { line in
-                    Text(line)
-                        .font(.system(.caption2, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-            }
-            .padding(.top, 8)
-        }
-        .padding()
-        .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 16))
-    }
-
     private func formatTime(_ date: Date) -> String {
         let fmt = DateFormatter()
-        fmt.dateFormat = "MM-dd HH:mm:ss"
+        fmt.dateFormat = Calendar.current.isDateInToday(date) ? "HH:mm:ss" : "MM-dd HH:mm"
         return fmt.string(from: date)
     }
 }
 
-// MARK: - 环形电量仪表组件
+// MARK: - 环形电量仪表
 
 struct BatteryGaugeView: View {
     let title: String
@@ -294,7 +308,7 @@ struct BatteryGaugeView: View {
     }
 
     private var ringColor: Color {
-        guard let level = unit.level else { return .gray.opacity(0.4) }
+        guard let level = unit.level else { return .gray.opacity(0.35) }
         if level <= lowThreshold { return .red }
         if level <= 40 { return .yellow }
         return .green
@@ -333,5 +347,78 @@ struct BatteryGaugeView: View {
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity)
+    }
+}
+
+// MARK: - 诊断信息页
+
+private struct DiagnosticsSheetView: View {
+    @EnvironmentObject private var bt: FreeClipBluetoothManager
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("状态") {
+                    LabeledContent("App Group", value: SharedBatteryStore.shared.resolvedAppGroupID ?? "不可用")
+                    LabeledContent("通知权限", value: notificationStatusText)
+                    if let snap = bt.latestSnapshot {
+                        LabeledContent("数据通道", value: snap.source.rawValue)
+                    }
+                }
+
+                if let raw = bt.latestSnapshot?.rawHex, !raw.isEmpty {
+                    Section("最新报文") {
+                        Text(raw)
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                    }
+                }
+
+                Section {
+                    if bt.logs.isEmpty {
+                        Text("暂无日志")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(bt.logs.prefix(30), id: \.self) { line in
+                            Text(line)
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                } header: {
+                    HStack {
+                        Text("日志")
+                        Spacer()
+                        if !bt.logs.isEmpty {
+                            Button("清空", role: .destructive) {
+                                bt.clearLogs()
+                            }
+                            .font(.caption)
+                        }
+                    }
+                }
+            }
+            .navigationTitle("诊断信息")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("完成") {
+                        dismiss()
+                    }
+                }
+            }
+        }
+    }
+
+    private var notificationStatusText: String {
+        switch bt.notificationStatus {
+        case .authorized: return "已开启"
+        case .provisional: return "临时允许"
+        case .ephemeral: return "限时允许"
+        case .denied: return "已关闭"
+        case .notDetermined: return "未请求"
+        @unknown default: return "未知"
+        }
     }
 }

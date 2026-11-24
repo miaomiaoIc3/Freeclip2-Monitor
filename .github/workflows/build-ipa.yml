@@ -33,10 +33,37 @@ jobs:
             AD_HOC_CODE_SIGNING_ALLOWED=NO \
             build
 
-      - name: Package unsigned IPA
+      - name: Ad-hoc sign with entitlements and package IPA
         run: |
+          rm -rf Payload FreeClipMonitor.ipa
           mkdir -p Payload
           cp -r build/Build/Products/Release-iphoneos/FreeClipMonitor.app Payload/
+
+          # Embed App Group entitlements via ad-hoc codesign so SideStore/AltStore
+          # detects and provisions the shared container for both the app and widget.
+          codesign --force --sign - \
+            --entitlements Widget/FreeClipMonitorWidget.entitlements \
+            --timestamp=none \
+            Payload/FreeClipMonitor.app/PlugIns/FreeClipMonitorWidget.appex
+
+          codesign --force --sign - \
+            --entitlements App/FreeClipMonitor.entitlements \
+            --timestamp=none \
+            Payload/FreeClipMonitor.app
+
+          echo "=== Verify App Entitlements ==="
+          codesign -d --entitlements - --xml Payload/FreeClipMonitor.app | tee /tmp/app_ent.xml
+          grep -F "group.com.freeclip.monitor" /tmp/app_ent.xml
+
+          echo "=== Verify Widget Entitlements ==="
+          codesign -d --entitlements - --xml Payload/FreeClipMonitor.app/PlugIns/FreeClipMonitorWidget.appex | tee /tmp/widget_ent.xml
+          grep -F "group.com.freeclip.monitor" /tmp/widget_ent.xml
+
+          echo "=== Verify App Icon ==="
+          test -f Payload/FreeClipMonitor.app/Assets.car
+          plutil -p Payload/FreeClipMonitor.app/Info.plist | grep -F "AppIcon"
+          ls -la Payload/FreeClipMonitor.app/AppIcon* Payload/FreeClipMonitor.app/Assets.car || true
+
           zip -qry FreeClipMonitor.ipa Payload
           ls -lh FreeClipMonitor.ipa
 

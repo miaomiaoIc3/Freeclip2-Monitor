@@ -40,9 +40,18 @@ struct FreeClipSnapshot: Codable, Equatable {
     let timestamp: Date
     let rawHex: String
 
-    /// 摘要文案（用于通知与锁屏组件）
+    /// 摘要文案（用于通知与小组件）
     var summaryLine: String {
-        "盒 \(caseBattery.displayText) · 耳机 \(earbud1.displayText) / \(earbud2.displayText)"
+        "充电盒 \(caseBattery.displayText) · 耳机 \(earbud1.displayText) / \(earbud2.displayText)"
+    }
+
+    /// 电量、充电或盒盖状态是否相对上次有实质变化
+    func hasSignificantChange(comparedTo other: FreeClipSnapshot?) -> Bool {
+        guard let other else { return true }
+        return caseBattery != other.caseBattery
+            || earbud1 != other.earbud1
+            || earbud2 != other.earbud2
+            || lidState != other.lidState
     }
 
     /// 充电盒是否处于低电状态

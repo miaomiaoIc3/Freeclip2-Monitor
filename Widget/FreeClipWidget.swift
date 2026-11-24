@@ -4,32 +4,38 @@ import SwiftUI
 struct FreeClipWidgetEntry: TimelineEntry {
     let date: Date
     let snapshot: FreeClipSnapshot?
+    let lowThreshold: Int
 }
 
 struct FreeClipWidgetProvider: TimelineProvider {
-    func placeholder(in context: Context) -> FreeClipWidgetEntry {
-        FreeClipWidgetEntry(
-            date: Date(),
-            snapshot: FreeClipSnapshot(
-                caseBattery: BatteryUnit(level: 85, isCharging: false),
-                earbud1: BatteryUnit(level: 100, isCharging: true),
-                earbud2: BatteryUnit(level: 100, isCharging: true),
-                lidState: .closed,
-                source: .fdeeBroadcast,
-                timestamp: Date(),
-                rawHex: ""
-            )
+    private func sampleSnapshot() -> FreeClipSnapshot {
+        FreeClipSnapshot(
+            caseBattery: BatteryUnit(level: 85, isCharging: false),
+            earbud1: BatteryUnit(level: 100, isCharging: true),
+            earbud2: BatteryUnit(level: 100, isCharging: true),
+            lidState: .closed,
+            source: .fdeeBroadcast,
+            timestamp: Date(),
+            rawHex: ""
         )
     }
 
+    func placeholder(in context: Context) -> FreeClipWidgetEntry {
+        FreeClipWidgetEntry(date: Date(), snapshot: sampleSnapshot(), lowThreshold: 20)
+    }
+
     func getSnapshot(in context: Context, completion: @escaping (FreeClipWidgetEntry) -> Void) {
-        let snap = SharedBatteryStore.shared.loadSnapshot()
-        completion(FreeClipWidgetEntry(date: Date(), snapshot: snap))
+        let store = SharedBatteryStore.shared
+        let settings = store.loadSettings()
+        let snap = store.loadSnapshot() ?? (context.isPreview ? sampleSnapshot() : nil)
+        completion(FreeClipWidgetEntry(date: Date(), snapshot: snap, lowThreshold: settings.lowBatteryThreshold))
     }
 
     func getTimeline(in context: Context, completion: @escaping (Timeline<FreeClipWidgetEntry>) -> Void) {
-        let snap = SharedBatteryStore.shared.loadSnapshot()
-        let entry = FreeClipWidgetEntry(date: Date(), snapshot: snap)
+        let store = SharedBatteryStore.shared
+        let settings = store.loadSettings()
+        let snap = store.loadSnapshot()
+        let entry = FreeClipWidgetEntry(date: Date(), snapshot: snap, lowThreshold: settings.lowBatteryThreshold)
         let nextRefresh = Calendar.current.date(byAdding: .minute, value: 30, to: Date()) ?? Date().addingTimeInterval(1800)
         completion(Timeline(entries: [entry], policy: .after(nextRefresh)))
     }
@@ -56,21 +62,21 @@ struct FreeClipWidgetView: View {
 
     private var snap: FreeClipSnapshot? { entry.snapshot }
 
-    private func ringColor(for unit: BatteryUnit?) -> Color {
-        guard let lvl = unit?.level else { return .gray }
-        if lvl <= 20 { return .red }
+    private func ringColor(for unit: BatteryUnit?, lowThreshold: Int) -> Color {
+        guard let lvl = unit?.level else { return .gray.opacity(0.4) }
+        if lvl <= lowThreshold { return .red }
         if lvl <= 40 { return .yellow }
         return .green
     }
 
-    // MARK: - 桌面小号 (2x2)：重点突出充电盒 + 两耳紧凑展示
+    // MARK: - 桌面小号 (2x2)
 
     private var smallHomeView: some View {
         VStack(spacing: 8) {
-            HStack {
+            HStack(spacing: 4) {
                 Image(systemName: "earbuds")
                     .font(.caption)
-                    .foregroundStyle(ringColor(for: snap?.caseBattery))
+                    .foregroundStyle(ringColor(for: snap?.caseBattery, lowThreshold: entry.lowThreshold))
                 Text("FreeClip 2")
                     .font(.caption.bold())
                     .lineLimit(1)
@@ -79,13 +85,22 @@ struct FreeClipWidgetView: View {
 
             ZStack {
                 Circle()
-                    .stroke(Color.gray.opacity(0.25), lineWidth: 8)
+                    .stroke(Color.gray.opacity(0.22), lineWidth: 8)
                 Circle()
                     .trim(from: 0, to: Double(snap?.caseBattery.level ?? 0) / 100.0)
-                    .stroke(ringColor(for: snap?.caseBattery), style: StrokeStyle(lineWidth: 8, lineCap: .round))
+                    .stroke(
+                        ringColor(for: snap?.caseBattery, lowThreshold: entry.lowThreshold),
+                        style: StrokeStyle(lineWidth: 8, lineCap: .round)
+                    )
                     .rotationEffect(.degrees(-90))
+
                 VStack(spacing: 1) {
-                    Text(snap?.caseBattery.displayText ?? "--")
+                    if snap?.caseBattery.isCharging == true {
+                        Image(systemName: "bolt.fill")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.green)
+                    }
+                    Text(snap?.caseBattery.shortPercent ?? "--")
                         .font(.system(size: 18, weight: .bold, design: .rounded))
                     Text("充电盒")
                         .font(.system(size: 9))
@@ -104,29 +119,29 @@ struct FreeClipWidgetView: View {
         }
     }
 
-    // MARK: - 桌面中号 (4x2)：三项真实电量圆环一字排开
+    // MARK: - 桌面中号 (4x2)
 
     private var mediumHomeView: some View {
         VStack(spacing: 10) {
             HStack {
-                Label("HUAWEI FreeClip 2", systemImage: "earbuds")
+                Label("FreeClip 2", systemImage: "earbuds")
                     .font(.caption.bold())
                 Spacer()
                 if let snap {
-                    Text("\(snap.lidState.rawValue) · \(shortTime(snap.timestamp))")
+                    Text(headerMeta(for: snap))
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 } else {
-                    Text("等待首次扫描")
+                    Text("暂无数据")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
             }
 
             HStack(spacing: 16) {
-                miniRing(title: "充电盒", unit: snap?.caseBattery)
-                miniRing(title: "耳机 1", unit: snap?.earbud1)
-                miniRing(title: "耳机 2", unit: snap?.earbud2)
+                miniRing(title: "充电盒", unit: snap?.caseBattery, lowThreshold: entry.lowThreshold)
+                miniRing(title: "耳机 1", unit: snap?.earbud1, lowThreshold: 15)
+                miniRing(title: "耳机 2", unit: snap?.earbud2, lowThreshold: 15)
             }
         }
         .containerBackground(for: .widget) {
@@ -134,18 +149,36 @@ struct FreeClipWidgetView: View {
         }
     }
 
-    private func miniRing(title: String, unit: BatteryUnit?) -> some View {
-        VStack(spacing: 4) {
+    private func headerMeta(for snap: FreeClipSnapshot) -> String {
+        if snap.lidState != .unknown {
+            return "\(snap.lidState.rawValue) · \(shortTime(snap.timestamp))"
+        }
+        return shortTime(snap.timestamp)
+    }
+
+    private func miniRing(title: String, unit: BatteryUnit?, lowThreshold: Int) -> some View {
+        VStack(spacing: 5) {
             ZStack {
                 Circle()
-                    .stroke(Color.gray.opacity(0.25), lineWidth: 7)
+                    .stroke(Color.gray.opacity(0.22), lineWidth: 7)
                 Circle()
                     .trim(from: 0, to: Double(unit?.level ?? 0) / 100.0)
-                    .stroke(ringColor(for: unit), style: StrokeStyle(lineWidth: 7, lineCap: .round))
+                    .stroke(
+                        ringColor(for: unit, lowThreshold: lowThreshold),
+                        style: StrokeStyle(lineWidth: 7, lineCap: .round)
+                    )
                     .rotationEffect(.degrees(-90))
-                Text(unit?.displayText ?? "--")
-                    .font(.system(size: 13, weight: .bold, design: .rounded))
-                    .minimumScaleFactor(0.7)
+
+                VStack(spacing: 1) {
+                    if unit?.isCharging == true {
+                        Image(systemName: "bolt.fill")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.green)
+                    }
+                    Text(unit?.shortPercent ?? "--")
+                        .font(.system(size: 14, weight: .bold, design: .rounded))
+                        .minimumScaleFactor(0.75)
+                }
             }
             .frame(width: 62, height: 62)
 
@@ -175,7 +208,7 @@ struct FreeClipWidgetView: View {
 
     private var lockScreenRectangularView: some View {
         VStack(alignment: .leading, spacing: 3) {
-            HStack {
+            HStack(spacing: 4) {
                 Image(systemName: "earbuds")
                 Text("FreeClip 2")
                     .font(.headline)
@@ -183,7 +216,7 @@ struct FreeClipWidgetView: View {
             Text("盒 \(snap?.caseBattery.displayText ?? "--") · 耳机 \(snap?.earbud1.shortPercent ?? "--")/\(snap?.earbud2.shortPercent ?? "--")")
                 .font(.caption)
             if let snap {
-                Text("更新于 \(shortTime(snap.timestamp))")
+                Text(shortTime(snap.timestamp))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
@@ -214,8 +247,8 @@ struct FreeClipBatteryWidget: Widget {
         StaticConfiguration(kind: kind, provider: FreeClipWidgetProvider()) { entry in
             FreeClipWidgetView(entry: entry)
         }
-        .configurationDisplayName("FreeClip 2 真实电量")
-        .description("显示华为 FreeClip 2 充电盒与双耳真实蓝牙电量。")
+        .configurationDisplayName("FreeClip 2")
+        .description("查看充电盒与耳机电量。")
         .supportedFamilies([.systemSmall, .systemMedium, .accessoryCircular, .accessoryRectangular])
     }
 }
