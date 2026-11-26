@@ -7,9 +7,18 @@ enum NotificationDeliveryResult: Equatable {
     case failed(String)
 }
 
+enum NotificationChannel {
+    case manual
+    case connect
+    case disconnect
+}
+
 final class BatteryNotificationManager: NSObject, UNUserNotificationCenterDelegate {
     static let shared = BatteryNotificationManager()
-    private var lastNotificationSentAt: Date?
+
+    /// 连接与断开各自独立记录冷却时间，绝不互相阻塞
+    private var lastConnectSentAt: Date?
+    private var lastDisconnectSentAt: Date?
 
     private override init() {
         super.init()
@@ -51,14 +60,35 @@ final class BatteryNotificationManager: NSObject, UNUserNotificationCenterDelega
         }
     }
 
+    func resetChannelCooldown(for oppositeOf: NotificationChannel) {
+        switch oppositeOf {
+        case .connect:
+            lastDisconnectSentAt = nil
+        case .disconnect:
+            lastConnectSentAt = nil
+        case .manual:
+            break
+        }
+    }
+
     @discardableResult
     func sendBatteryReport(
         _ snapshot: FreeClipSnapshot,
         settings: MonitorSettings,
-        force: Bool = true
+        channel: NotificationChannel = .manual
     ) async -> NotificationDeliveryResult {
-        if !force, let last = lastNotificationSentAt, Date().timeIntervalSince(last) < 4 {
-            return .delivered
+        let now = Date()
+        switch channel {
+        case .connect:
+            if let last = lastConnectSentAt, now.timeIntervalSince(last) < 6 {
+                return .delivered
+            }
+        case .disconnect:
+            if let last = lastDisconnectSentAt, now.timeIntervalSince(last) < 6 {
+                return .delivered
+            }
+        case .manual:
+            break
         }
 
         let content = UNMutableNotificationContent()
@@ -70,9 +100,23 @@ final class BatteryNotificationManager: NSObject, UNUserNotificationCenterDelega
         content.body = snapshot.summaryLine
         content.sound = .default
 
-        let result = await deliver(content: content, idPrefix: "freeclip-battery")
+        let idTag: String
+        switch channel {
+        case .connect: idTag = "freeclip-connect"
+        case .disconnect: idTag = "freeclip-disconnect"
+        case .manual: idTag = "freeclip-manual"
+        }
+
+        let result = await deliver(content: content, idPrefix: idTag)
         if result == .delivered {
-            lastNotificationSentAt = Date()
+            switch channel {
+            case .connect:
+                lastConnectSentAt = Date()
+            case .disconnect:
+                lastDisconnectSentAt = Date()
+            case .manual:
+                break
+            }
         }
         return result
     }
@@ -122,7 +166,6 @@ final class BatteryNotificationManager: NSObject, UNUserNotificationCenterDelega
             return .denied
         }
 
-        // trigger: nil 立即投递，避免短时后台/快捷指令进程在定时触发前挂起
         let request = UNNotificationRequest(
             identifier: "\(idPrefix)-\(UUID().uuidString)",
             content: content,

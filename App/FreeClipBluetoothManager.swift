@@ -1,5 +1,6 @@
 import Foundation
 import CoreBluetooth
+import AVFoundation
 import UIKit
 import UserNotifications
 
@@ -7,6 +8,12 @@ struct OneShotScanOutcome {
     let snapshot: FreeClipSnapshot?
     let isFresh: Bool
     let notificationResult: NotificationDeliveryResult?
+}
+
+enum ScanTriggerMode {
+    case manual
+    case connectShortcut
+    case disconnectShortcut
 }
 
 @MainActor
@@ -17,10 +24,16 @@ final class FreeClipBluetoothManager: NSObject, ObservableObject {
     @Published var bluetoothState: CBManagerState = .unknown
     @Published var isScanning: Bool = false
     @Published var isGattConnected: Bool = false
+    @Published var isAudioConnected: Bool = false
     @Published var discoveredDeviceName: String?
     @Published var settings: MonitorSettings
     @Published var logs: [String] = []
     @Published var notificationStatus: UNAuthorizationStatus = .notDetermined
+
+    /// 综合连接态（BLE FD21 连接或系统音频路由连接到 FreeClip 均视为已连接）
+    var isDeviceConnected: Bool {
+        isGattConnected || isAudioConnected
+    }
 
     private var centralManager: CBCentralManager!
     private var activePeripheral: CBPeripheral?
@@ -39,6 +52,11 @@ final class FreeClipBluetoothManager: NSObject, ObservableObject {
     private var lastAutoNotifiedCaseLow = false
     private var lastSnapshotLogAt: Date?
 
+    /// 记录上一次综合连接状态，确保连接与断开事件严格按边沿（false <-> true）各触发一次
+    private var previousEffectiveConnected: Bool = false
+    private var connectTransitionTask: Task<Void, Never>?
+    private var disconnectTransitionTask: Task<Void, Never>?
+
     private override init() {
         let store = SharedBatteryStore.shared
         self.latestSnapshot = store.loadSnapshot()
@@ -46,12 +64,195 @@ final class FreeClipBluetoothManager: NSObject, ObservableObject {
         self.logs = store.loadLogs()
         super.init()
 
+        // 初始化时同步检测当前系统音频输出是否已连着 FreeClip
+        let initialAudio = Self.detectFreeClipAudioRoute()
+        self.isAudioConnected = initialAudio.connected
+        if let routeName = initialAudio.name {
+            self.discoveredDeviceName = routeName
+        }
+        self.previousEffectiveConnected = initialAudio.connected
+
         self.centralManager = CBCentralManager(
             delegate: self,
             queue: .main,
             options: [CBCentralManagerOptionRestoreIdentifierKey: "com.freeclip.monitor.central.v1"]
         )
+
+        observeAudioRouteChanges()
     }
+
+    // ------------------------------------------------------------------------
+    // 系统蓝牙音频路由监听（无需激活音频会话，不打断任何音乐/通话）
+    // ------------------------------------------------------------------------
+
+    private func observeAudioRouteChanges() {
+        NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.evaluateAudioRouteState()
+            }
+        }
+    }
+
+    private static func detectFreeClipAudioRoute() -> (connected: Bool, name: String?) {
+        let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
+        for port in outputs {
+            if port.portName.localizedCaseInsensitiveContains("FreeClip") {
+                return (true, port.portName)
+            }
+        }
+        return (false, nil)
+    }
+
+    private func evaluateAudioRouteState() {
+        let route = Self.detectFreeClipAudioRoute()
+        let changed = (route.connected != isAudioConnected)
+        isAudioConnected = route.connected
+        if let name = route.name {
+            discoveredDeviceName = name
+        }
+        if route.connected {
+            attemptGattAttachIfConnected()
+        }
+        if changed {
+            log(route.connected ? "检测到耳机音频已连接" : "检测到耳机音频已断开")
+            evaluateConnectionTransition()
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // 连接 / 断开严格隔离状态机（各自只看各自开关，绝不串台）
+    // ------------------------------------------------------------------------
+
+    private func evaluateConnectionTransition() {
+        let nowConnected = isDeviceConnected
+        guard nowConnected != previousEffectiveConnected else { return }
+        previousEffectiveConnected = nowConnected
+
+        if nowConnected {
+            disconnectTransitionTask?.cancel()
+            disconnectTransitionTask = nil
+            BatteryNotificationManager.shared.resetChannelCooldown(for: .connect)
+            triggerConnectPipeline()
+        } else {
+            connectTransitionTask?.cancel()
+            connectTransitionTask = nil
+            BatteryNotificationManager.shared.resetChannelCooldown(for: .disconnect)
+            triggerDisconnectPipeline()
+        }
+    }
+
+    /// 耳机连接事件处理：仅受 settings.notifyOnConnect 控制
+    private func triggerConnectPipeline() {
+        connectTransitionTask?.cancel()
+        let connectNotifyEnabled = settings.notifyOnConnect
+
+        connectTransitionTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let connectedAt = Date()
+
+            // 主动查询一次最新电量（同时给 FD21 服务发现与 FDEE 广播留出最多 1.8 秒刷新窗口）
+            if self.centralManager.state == .poweredOn {
+                if UIApplication.shared.applicationState == .active {
+                    self.centralManager.scanForPeripherals(
+                        withServices: nil,
+                        options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
+                    )
+                } else {
+                    self.centralManager.scanForPeripherals(
+                        withServices: [self.fdeeUUID, self.fd21ServiceUUID, self.fd9aUUID],
+                        options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
+                    )
+                }
+                self.sendFD21BatteryQuery()
+            }
+
+            // 等待最新快照到达（最多 1.8 秒，一旦收到新快照立即提前结束等待）
+            var waited = 0
+            while waited < 18 {
+                if Task.isCancelled { return }
+                if let snap = self.latestSnapshot, snap.timestamp >= connectedAt {
+                    break
+                }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                waited += 1
+            }
+
+            guard !Task.isCancelled else { return }
+
+            // 重新读取实时开关状态，严格只检查 notifyOnConnect
+            guard self.settings.notifyOnConnect && connectNotifyEnabled else {
+                self.log("连接推送已关闭，跳过连接通知")
+                return
+            }
+
+            if let snap = self.latestSnapshot {
+                self.log("触发连接电量通知：\(snap.summaryLine)")
+                await BatteryNotificationManager.shared.sendBatteryReport(
+                    snap,
+                    settings: self.settings,
+                    channel: .connect
+                )
+            } else {
+                self.log("已连接，但暂无可用电量快照")
+            }
+        }
+    }
+
+    /// 耳机断开事件处理：仅受 settings.notifyOnDisconnect 控制
+    private func triggerDisconnectPipeline() {
+        disconnectTransitionTask?.cancel()
+        let disconnectNotifyEnabled = settings.notifyOnDisconnect
+
+        disconnectTransitionTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let disconnectedAt = Date()
+
+            // 耳机入盒瞬间往往伴随新的 FDEE 广播，短时等待最多 1.0 秒抓取入盒最新电量
+            if self.centralManager.state == .poweredOn {
+                let isFg = (UIApplication.shared.applicationState == .active)
+                let services: [CBUUID]? = isFg ? nil : [self.fdeeUUID, self.fd21ServiceUUID, self.fd9aUUID]
+                self.centralManager.scanForPeripherals(
+                    withServices: services,
+                    options: [CBCentralManagerScanOptionAllowDuplicatesKey: isFg]
+                )
+            }
+
+            var waited = 0
+            while waited < 10 {
+                if Task.isCancelled { return }
+                if let snap = self.latestSnapshot, snap.timestamp >= disconnectedAt {
+                    break
+                }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                waited += 1
+            }
+
+            guard !Task.isCancelled else { return }
+
+            // 重新读取实时开关状态，严格只检查 notifyOnDisconnect
+            guard self.settings.notifyOnDisconnect && disconnectNotifyEnabled else {
+                self.log("断开推送已关闭，跳过断开通知")
+                return
+            }
+
+            if let snap = self.latestSnapshot {
+                self.log("触发断开电量通知：\(snap.summaryLine)")
+                await BatteryNotificationManager.shared.sendBatteryReport(
+                    snap,
+                    settings: self.settings,
+                    channel: .disconnect
+                )
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // 基础设置与日志
+    // ------------------------------------------------------------------------
 
     func refreshNotificationStatus() async {
         notificationStatus = await BatteryNotificationManager.shared.authorizationStatus()
@@ -73,10 +274,11 @@ final class FreeClipBluetoothManager: NSObject, ObservableObject {
     }
 
     // ------------------------------------------------------------------------
-    // 前台 / 后台扫描控制
+    // 前台 / 后台扫描与 GATT 重连控制
     // ------------------------------------------------------------------------
 
     func startForegroundScanning() {
+        evaluateAudioRouteState()
         guard centralManager.state == .poweredOn else { return }
         isScanning = true
         centralManager.scanForPeripherals(
@@ -93,7 +295,7 @@ final class FreeClipBluetoothManager: NSObject, ObservableObject {
             withServices: [fdeeUUID, fd21ServiceUUID, fd9aUUID],
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
         )
-        reconnectSavedPeripheralIfPossible()
+        attemptGattAttachIfConnected()
     }
 
     func stopScanning() {
@@ -104,8 +306,18 @@ final class FreeClipBluetoothManager: NSObject, ObservableObject {
 
     func attemptGattAttachIfConnected() {
         guard centralManager.state == .poweredOn else { return }
-        let connected = centralManager.retrieveConnectedPeripherals(withServices: [fd21ServiceUUID])
-        if let peripheral = connected.first {
+        let probeServices = [
+            fd21ServiceUUID,
+            fdeeUUID,
+            fd9aUUID,
+            CBUUID(string: "180F"),
+            CBUUID(string: "180A")
+        ]
+        let connected = centralManager.retrieveConnectedPeripherals(withServices: probeServices)
+        if let peripheral = connected.first(where: {
+            ($0.name?.localizedCaseInsensitiveContains("FreeClip") == true)
+            || ($0.identifier.uuidString == settings.savedPeripheralUUID)
+        }) ?? connected.first(where: { $0.name == nil && connected.count == 1 && isAudioConnected }) {
             connectGatt(peripheral)
         } else {
             reconnectSavedPeripheralIfPossible()
@@ -117,13 +329,16 @@ final class FreeClipBluetoothManager: NSObject, ObservableObject {
               let uuidStr = settings.savedPeripheralUUID,
               let uuid = UUID(uuidString: uuidStr) else { return }
         let peripherals = centralManager.retrievePeripherals(withIdentifiers: [uuid])
-        if let peripheral = peripherals.first, peripheral.state != .connected {
+        if let peripheral = peripherals.first {
             activePeripheral = peripheral
             peripheral.delegate = self
-            centralManager.connect(peripheral, options: nil)
+            if peripheral.state != .connected && peripheral.state != .connecting {
+                centralManager.connect(peripheral, options: nil)
+            }
         }
     }
 
+    /// 仅对可连接 GATT 外设调用并持久化 UUID（防止被不可连接 FDEE 广播的随机地址覆盖！）
     private func connectGatt(_ peripheral: CBPeripheral) {
         activePeripheral = peripheral
         peripheral.delegate = self
@@ -132,7 +347,13 @@ final class FreeClipBluetoothManager: NSObject, ObservableObject {
             updated.savedPeripheralUUID = peripheral.identifier.uuidString
             updateSettings(updated)
         }
-        centralManager.connect(peripheral, options: nil)
+        if peripheral.state != .connected && peripheral.state != .connecting {
+            centralManager.connect(peripheral, options: nil)
+        } else if peripheral.state == .connected && !isGattConnected {
+            isGattConnected = true
+            peripheral.discoverServices([fd21ServiceUUID])
+            evaluateConnectionTransition()
+        }
     }
 
     func sendFD21BatteryQuery() {
@@ -143,16 +364,30 @@ final class FreeClipBluetoothManager: NSObject, ObservableObject {
     }
 
     // ------------------------------------------------------------------------
-    // 单次扫描并推送通知（供手动按钮与快捷指令调用）
+    // 单次扫描（供手动按钮与快捷指令调用，按 triggerMode 严格区分通知策略）
     // ------------------------------------------------------------------------
 
     func performOneShotScan(
         timeoutSeconds: TimeInterval = 4.5,
         isForeground: Bool,
-        notifyAlways: Bool,
+        triggerMode: ScanTriggerMode = .manual,
         reason: String
     ) async -> OneShotScanOutcome {
         log("触发扫描：\(reason)")
+
+        let shouldNotify: Bool
+        let channel: NotificationChannel
+        switch triggerMode {
+        case .manual:
+            shouldNotify = true
+            channel = .manual
+        case .connectShortcut:
+            shouldNotify = settings.notifyOnConnect
+            channel = .connect
+        case .disconnectShortcut:
+            shouldNotify = settings.notifyOnDisconnect
+            channel = .disconnect
+        }
 
         var waitCycles = 0
         while centralManager.state == .unknown && waitCycles < 15 {
@@ -162,12 +397,9 @@ final class FreeClipBluetoothManager: NSObject, ObservableObject {
 
         guard centralManager.state == .poweredOn else {
             log("蓝牙未开启")
-            let notifyRes: NotificationDeliveryResult?
-            if notifyAlways {
-                notifyRes = await BatteryNotificationManager.shared.sendScanFallbackNotice(cached: latestSnapshot)
-            } else {
-                notifyRes = nil
-            }
+            let notifyRes: NotificationDeliveryResult? = shouldNotify
+                ? await BatteryNotificationManager.shared.sendScanFallbackNotice(cached: latestSnapshot)
+                : nil
             await refreshNotificationStatus()
             return OneShotScanOutcome(snapshot: latestSnapshot, isFresh: false, notificationResult: notifyRes)
         }
@@ -201,11 +433,11 @@ final class FreeClipBluetoothManager: NSObject, ObservableObject {
         var notifyResult: NotificationDeliveryResult? = nil
 
         if let fresh = result {
-            if notifyAlways || settings.notifyOnEveryScan || fresh.isCaseLow(threshold: settings.lowBatteryThreshold) {
+            if shouldNotify {
                 notifyResult = await BatteryNotificationManager.shared.sendBatteryReport(
                     fresh,
                     settings: settings,
-                    force: true
+                    channel: channel
                 )
             }
             await refreshNotificationStatus()
@@ -215,8 +447,16 @@ final class FreeClipBluetoothManager: NSObject, ObservableObject {
             if let cached = latestSnapshot {
                 SharedBatteryStore.shared.saveSnapshot(cached, forceWidgetReload: true)
             }
-            if notifyAlways {
-                notifyResult = await BatteryNotificationManager.shared.sendScanFallbackNotice(cached: latestSnapshot)
+            if shouldNotify {
+                if let cached = latestSnapshot, triggerMode != .manual {
+                    notifyResult = await BatteryNotificationManager.shared.sendBatteryReport(
+                        cached,
+                        settings: settings,
+                        channel: channel
+                    )
+                } else {
+                    notifyResult = await BatteryNotificationManager.shared.sendScanFallbackNotice(cached: latestSnapshot)
+                }
             }
             await refreshNotificationStatus()
             return OneShotScanOutcome(snapshot: latestSnapshot, isFresh: false, notificationResult: notifyResult)
@@ -297,10 +537,14 @@ extension FreeClipBluetoothManager: CBCentralManagerDelegate {
             if central.state == .poweredOn {
                 if UIApplication.shared.applicationState == .active {
                     self.startForegroundScanning()
+                } else {
+                    // 后台唤醒时同样挂载重连与后台服务扫描，确保连接/断开事件都能捕获
+                    self.switchToBackgroundMode()
                 }
             } else {
                 self.isScanning = false
                 self.isGattConnected = false
+                self.previousEffectiveConnected = self.isAudioConnected
             }
         }
     }
@@ -312,7 +556,14 @@ extension FreeClipBluetoothManager: CBCentralManagerDelegate {
                let first = peripherals.first {
                 self.activePeripheral = first
                 first.delegate = self
-                self.isGattConnected = (first.state == .connected)
+                let connected = (first.state == .connected)
+                self.isGattConnected = connected
+                if connected {
+                    first.discoverServices([self.fd21ServiceUUID])
+                } else if first.state != .connecting {
+                    central.connect(first, options: nil)
+                }
+                self.evaluateConnectionTransition()
             }
         }
     }
@@ -331,24 +582,23 @@ extension FreeClipBluetoothManager: CBCentralManagerDelegate {
             let isFreeClipByName = (name?.localizedCaseInsensitiveContains("FreeClip") == true)
             let fdeeData = serviceData?[self.fdeeUUID]
 
-            if let fdeeData {
-                if let snapshot = FreeClipProtocol.parseFDEE(fdeeData) {
-                    self.discoveredDeviceName = name ?? "HUAWEI FreeClip 2"
-                    if self.settings.savedPeripheralUUID != peripheral.identifier.uuidString {
-                        var updated = self.settings
-                        updated.savedPeripheralUUID = peripheral.identifier.uuidString
-                        self.updateSettings(updated)
-                    }
-                    self.acceptSnapshot(snapshot)
-                    return
-                }
-            }
-
+            // 若发现可连接的 FreeClip 外设，优先建立/保持 GATT 连接以实时感知连接与断开事件
             if isFreeClipByName && isConnectable {
                 self.discoveredDeviceName = name
                 if self.activePeripheral == nil || self.activePeripheral?.state == .disconnected {
                     self.connectGatt(peripheral)
                 }
+            }
+
+            if let fdeeData, let snapshot = FreeClipProtocol.parseFDEE(fdeeData) {
+                self.discoveredDeviceName = name ?? self.discoveredDeviceName ?? "HUAWEI FreeClip 2"
+                // 注意：只有可连接帧才更新 savedPeripheralUUID，避免被非连接广播的随机地址覆盖！
+                if isConnectable && self.settings.savedPeripheralUUID != peripheral.identifier.uuidString {
+                    var updated = self.settings
+                    updated.savedPeripheralUUID = peripheral.identifier.uuidString
+                    self.updateSettings(updated)
+                }
+                self.acceptSnapshot(snapshot)
             }
         }
     }
@@ -356,9 +606,15 @@ extension FreeClipBluetoothManager: CBCentralManagerDelegate {
     nonisolated func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         Task { @MainActor in
             self.isGattConnected = true
-            self.discoveredDeviceName = peripheral.name ?? "HUAWEI FreeClip 2"
-            self.log("GATT 已连接")
+            self.discoveredDeviceName = peripheral.name ?? self.discoveredDeviceName ?? "HUAWEI FreeClip 2"
+            if self.settings.savedPeripheralUUID != peripheral.identifier.uuidString {
+                var updated = self.settings
+                updated.savedPeripheralUUID = peripheral.identifier.uuidString
+                self.updateSettings(updated)
+            }
+            self.log("蓝牙 GATT 已连接")
             peripheral.discoverServices([self.fd21ServiceUUID])
+            self.evaluateConnectionTransition()
         }
     }
 
@@ -367,19 +623,13 @@ extension FreeClipBluetoothManager: CBCentralManagerDelegate {
             self.isGattConnected = false
             self.fd21NotifyChar = nil
             self.fd21WriteChar = nil
-            self.log("设备已断开")
+            self.log("蓝牙 GATT 已断开")
 
-            if self.settings.notifyOnEveryScan, let snap = self.latestSnapshot {
-                let settingsCopy = self.settings
-                Task {
-                    await BatteryNotificationManager.shared.sendBatteryReport(
-                        snap,
-                        settings: settingsCopy,
-                        force: false
-                    )
-                }
-            }
+            // 重新核对音频路由，避免系统在 GATT 断开同时音频也刚断开的竞态
+            self.isAudioConnected = Self.detectFreeClipAudioRoute().connected
+            self.evaluateConnectionTransition()
 
+            // 重新挂起自动连接监听，确保下次耳机出盒/开盖连上时系统后台立即唤醒 didConnect！
             self.reconnectSavedPeripheralIfPossible()
         }
     }
@@ -408,7 +658,7 @@ extension FreeClipBluetoothManager: CBPeripheralDelegate {
                     self.fd21WriteChar = c
                 }
             }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
                 self.sendFD21BatteryQuery()
             }
         }

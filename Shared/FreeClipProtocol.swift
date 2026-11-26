@@ -66,14 +66,63 @@ struct FreeClipSnapshot: Codable, Equatable {
 
 /// 用户偏好配置
 struct MonitorSettings: Codable, Equatable {
-    /// 每次断开/触发扫描都推送通知（符合“每次断开都推”的需求）
-    var notifyOnEveryScan: Bool = true
-    /// 充电盒低电醒目标记阈值（%）
+    /// 连接耳机时推送电量通知
+    var notifyOnConnect: Bool = true
+    /// 断开耳机时推送电量通知
+    var notifyOnDisconnect: Bool = true
+    /// 充电盒低电提醒阈值（%）
     var lowBatteryThreshold: Int = 20
     /// 充电盒充满 100% 时推送通知
     var notifyWhenFull: Bool = true
-    /// 上一次已保存的 FreeClip 2 CoreBluetooth Peripheral UUID 字符串
+    /// 上一次已保存的可连接 FreeClip 2 GATT 外设 UUID 字符串
     var savedPeripheralUUID: String? = nil
+
+    init(
+        notifyOnConnect: Bool = true,
+        notifyOnDisconnect: Bool = true,
+        lowBatteryThreshold: Int = 20,
+        notifyWhenFull: Bool = true,
+        savedPeripheralUUID: String? = nil
+    ) {
+        self.notifyOnConnect = notifyOnConnect
+        self.notifyOnDisconnect = notifyOnDisconnect
+        self.lowBatteryThreshold = lowBatteryThreshold
+        self.notifyWhenFull = notifyWhenFull
+        self.savedPeripheralUUID = savedPeripheralUUID
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case notifyOnConnect
+        case notifyOnDisconnect
+        case legacyNotifyOnEveryScan = "notifyOnEveryScan"
+        case lowBatteryThreshold
+        case notifyWhenFull
+        case savedPeripheralUUID
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.notifyOnConnect = try c.decodeIfPresent(Bool.self, forKey: .notifyOnConnect) ?? true
+        if let disconnectVal = try c.decodeIfPresent(Bool.self, forKey: .notifyOnDisconnect) {
+            self.notifyOnDisconnect = disconnectVal
+        } else if let legacyVal = try c.decodeIfPresent(Bool.self, forKey: .legacyNotifyOnEveryScan) {
+            self.notifyOnDisconnect = legacyVal
+        } else {
+            self.notifyOnDisconnect = true
+        }
+        self.lowBatteryThreshold = try c.decodeIfPresent(Int.self, forKey: .lowBatteryThreshold) ?? 20
+        self.notifyWhenFull = try c.decodeIfPresent(Bool.self, forKey: .notifyWhenFull) ?? true
+        self.savedPeripheralUUID = try c.decodeIfPresent(String.self, forKey: .savedPeripheralUUID)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(notifyOnConnect, forKey: .notifyOnConnect)
+        try c.encode(notifyOnDisconnect, forKey: .notifyOnDisconnect)
+        try c.encode(lowBatteryThreshold, forKey: .lowBatteryThreshold)
+        try c.encode(notifyWhenFull, forKey: .notifyWhenFull)
+        try c.encodeIfPresent(savedPeripheralUUID, forKey: .savedPeripheralUUID)
+    }
 }
 
 /// 华为 FreeClip 2 双通道协议解析器（FDEE 广播 + FD21 GATT 串口帧）

@@ -93,7 +93,7 @@ struct ContentView: View {
 
     private var statusDotColor: Color {
         if bt.bluetoothState != .poweredOn { return .red }
-        if bt.isGattConnected { return .green }
+        if bt.isDeviceConnected { return .green }
         if bt.isScanning { return .blue }
         return .gray
     }
@@ -103,7 +103,7 @@ struct ContentView: View {
         case .poweredOff: return "蓝牙未开启"
         case .unauthorized: return "需要蓝牙权限"
         case .poweredOn:
-            if bt.isGattConnected { return "已连接" }
+            if bt.isDeviceConnected { return "已连接" }
             if bt.isScanning { return "正在扫描" }
             return "已暂停"
         default:
@@ -168,7 +168,7 @@ struct ContentView: View {
                     let outcome = await bt.performOneShotScan(
                         timeoutSeconds: 4.5,
                         isForeground: true,
-                        notifyAlways: true,
+                        triggerMode: .manual,
                         reason: "手动刷新"
                     )
                     switch outcome.notificationResult {
@@ -247,11 +247,22 @@ struct ContentView: View {
                 .font(.subheadline.weight(.semibold))
                 .foregroundStyle(.secondary)
 
-            Toggle("断开时推送电量", isOn: Binding(
-                get: { bt.settings.notifyOnEveryScan },
+            Toggle("连接时推送电量", isOn: Binding(
+                get: { bt.settings.notifyOnConnect },
                 set: { val in
                     var s = bt.settings
-                    s.notifyOnEveryScan = val
+                    s.notifyOnConnect = val
+                    bt.updateSettings(s)
+                }
+            ))
+
+            Divider()
+
+            Toggle("断开时推送电量", isOn: Binding(
+                get: { bt.settings.notifyOnDisconnect },
+                set: { val in
+                    var s = bt.settings
+                    s.notifyOnDisconnect = val
                     bt.updateSettings(s)
                 }
             ))
