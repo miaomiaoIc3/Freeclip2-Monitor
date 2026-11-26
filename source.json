@@ -19,6 +19,15 @@
       "category": "utilities",
       "versions": [
         {
+          "version": "0.9.1",
+          "buildVersion": "2",
+          "date": "2026-11-26T16:22:19Z",
+          "localizedDescription": "新增独立的「连接时推送电量」开关，与「断开时推送电量」完全分离；增强蓝牙连接/断开状态监听与后台自动重连稳定性。",
+          "downloadURL": "https://github.com/miaomiaoIc3/Freeclip2-Monitor/releases/download/v0.9.1/FreeClipMonitor-v0.9.1.ipa",
+          "size": 1399842,
+          "minOSVersion": "17.0"
+        },
+        {
           "version": "0.9.0",
           "buildVersion": "1",
           "date": "2026-11-24T05:20:23Z",
