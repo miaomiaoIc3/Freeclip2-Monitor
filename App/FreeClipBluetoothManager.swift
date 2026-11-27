@@ -27,12 +27,18 @@ final class FreeClipBluetoothManager: NSObject, ObservableObject {
     @Published var isAudioConnected: Bool = false
     @Published var discoveredDeviceName: String?
     @Published var settings: MonitorSettings
+    @Published private(set) var sessionState: EarbudSessionState
     @Published var logs: [String] = []
     @Published var notificationStatus: UNAuthorizationStatus = .notDetermined
 
-    /// 综合连接态（BLE FD21 连接或系统音频路由连接到 FreeClip 均视为已连接）
+    /// 底层链路综合连接态（BLE FD21 连接或系统音频路由连接到 FreeClip）
     var isDeviceConnected: Bool {
         isGattConnected || isAudioConnected
+    }
+
+    /// 供界面展示的会话在线状态（佩戴期间即使 BLE GATT 短暂省电休眠也不闪烁断开）
+    var isSessionActiveForUI: Bool {
+        isDeviceConnected || sessionState == .openedInCase || sessionState == .wearing
     }
 
     private var centralManager: CBCentralManager!
@@ -48,29 +54,55 @@ final class FreeClipBluetoothManager: NSObject, ObservableObject {
 
     private var pendingScanCompletion: ((FreeClipSnapshot?) -> Void)?
     private var pendingScanTimer: Timer?
+    private var pendingOneShotTriggerMode: ScanTriggerMode? = nil
     private var lastAutoNotifiedCaseFull = false
     private var lastAutoNotifiedCaseLow = false
     private var lastSnapshotLogAt: Date?
 
-    /// 记录上一次综合连接状态，确保连接与断开事件严格按边沿（false <-> true）各触发一次
-    private var previousEffectiveConnected: Bool = false
+    /// 会话状态持久化与防抖任务
+    private var lastSessionSavedAt: Date
+    private var lastSessionConnectedAt: Date = .distantPast
+    private var initialAudioConnectedAtLaunch: Bool = false
+    private var pendingColdLaunchReconcile: Bool = false
     private var connectTransitionTask: Task<Void, Never>?
     private var disconnectTransitionTask: Task<Void, Never>?
+    private var disconnectWatchdogTask: Task<Void, Never>?
+    private var returnedIdleResetTask: Task<Void, Never>?
+    private var coldLaunchReconcileTask: Task<Void, Never>?
+
+    /// 蓝牙与音频全部断开后的超时确认窗口（秒合盖休眠兜底，防止佩戴时短暂断连误触发）
+    private let fullDisconnectTimeoutSeconds: TimeInterval = 12.0
+    /// 进程冷启动时判定历史会话需重新核对的静默间隔阈值
+    private let coldLaunchStaleThresholdSeconds: TimeInterval = 180.0
 
     private override init() {
         let store = SharedBatteryStore.shared
         self.latestSnapshot = store.loadSnapshot()
         self.settings = store.loadSettings()
+        let savedSession = store.loadSessionRecord()
+        self.sessionState = savedSession.state
+        self.lastSessionSavedAt = savedSession.updatedAt
         self.logs = store.loadLogs()
         super.init()
 
         // 初始化时同步检测当前系统音频输出是否已连着 FreeClip
         let initialAudio = Self.detectFreeClipAudioRoute()
         self.isAudioConnected = initialAudio.connected
+        self.initialAudioConnectedAtLaunch = initialAudio.connected
         if let routeName = initialAudio.name {
             self.discoveredDeviceName = routeName
         }
-        self.previousEffectiveConnected = initialAudio.connected
+
+        // 若上次持久化的活跃会话距今已超过阈值，标记冷启动待核对（防止进程被杀期间已归盒导致状态卡死，同时避免仍在佩戴时重弹）
+        let age = Date().timeIntervalSince(savedSession.updatedAt)
+        if savedSession.state != .idle && age > coldLaunchStaleThresholdSeconds {
+            if initialAudio.connected && (savedSession.state == .wearing || savedSession.state == .openedInCase) {
+                // 启动瞬间音频仍在输出到耳机，说明用户从未摘下，直接续期当前活跃会话
+                self.touchSessionTimestamp(forceWrite: true)
+            } else {
+                self.pendingColdLaunchReconcile = true
+            }
+        }
 
         self.centralManager = CBCentralManager(
             delegate: self,
@@ -119,43 +151,352 @@ final class FreeClipBluetoothManager: NSObject, ObservableObject {
         }
         if changed {
             log(route.connected ? "检测到耳机音频已连接" : "检测到耳机音频已断开")
-            evaluateConnectionTransition()
+            evaluateLinkStateChange()
         }
     }
 
     // ------------------------------------------------------------------------
-    // 连接 / 断开严格隔离状态机（各自只看各自开关，绝不串台）
+    // AirPods 式物理在盒/佩戴会话状态机（方案 B：开盖即连、佩戴免打扰、归盒/长断联才断）
     // ------------------------------------------------------------------------
 
-    private func evaluateConnectionTransition() {
-        let nowConnected = isDeviceConnected
-        guard nowConnected != previousEffectiveConnected else { return }
-        previousEffectiveConnected = nowConnected
+    private func updateSessionState(_ newState: EarbudSessionState) {
+        let now = Date()
+        sessionState = newState
+        lastSessionSavedAt = now
+        SharedBatteryStore.shared.saveSessionRecord(
+            PersistedSessionRecord(state: newState, updatedAt: now)
+        )
+    }
 
-        if nowConnected {
-            disconnectTransitionTask?.cancel()
-            disconnectTransitionTask = nil
-            BatteryNotificationManager.shared.resetChannelCooldown(for: .connect)
-            triggerConnectPipeline()
+    private func touchSessionTimestamp(forceWrite: Bool = false) {
+        let now = Date()
+        guard forceWrite || now.timeIntervalSince(lastSessionSavedAt) >= 15 else { return }
+        lastSessionSavedAt = now
+        SharedBatteryStore.shared.saveSessionRecord(
+            PersistedSessionRecord(state: sessionState, updatedAt: now)
+        )
+    }
+
+    private func cancelDisconnectWatchdog() {
+        disconnectWatchdogTask?.cancel()
+        disconnectWatchdogTask = nil
+        returnedIdleResetTask?.cancel()
+        returnedIdleResetTask = nil
+    }
+
+    /// 处理底层链路（BLE GATT / 系统音频）通断变化
+    private func evaluateLinkStateChange() {
+        if isDeviceConnected {
+            cancelDisconnectWatchdog()
+
+            if pendingColdLaunchReconcile {
+                scheduleColdLaunchReconciliation()
+                return
+            }
+
+            switch sessionState {
+            case .idle:
+                // 方案 B：从待机态首次连上手机（如开盖瞬间），立即开启会话并触发一次连接推送
+                enterConnectedSession(
+                    targetState: .openedInCase,
+                    eventAt: Date(),
+                    reason: "耳机已连接手机（开盖/唤醒）",
+                    suppressNotify: pendingOneShotTriggerMode == .manual
+                )
+            case .openedInCase, .wearing:
+                // 佩戴或开盖会话已处于激活态：链路重连/声道切回不重复推送，仅静默刷新电量与心跳
+                touchSessionTimestamp()
+                sendFD21BatteryQuery()
+            case .returnedToCase:
+                // 双耳刚放回未合盖的充电盒内（已发过断开通知）：保持归盒态，静默监测是否再次取出
+                sendFD21BatteryQuery()
+            }
         } else {
-            connectTransitionTask?.cancel()
-            connectTransitionTask = nil
-            BatteryNotificationManager.shared.resetChannelCooldown(for: .disconnect)
-            triggerDisconnectPipeline()
+            if pendingColdLaunchReconcile {
+                scheduleColdLaunchReconciliation()
+                return
+            }
+
+            switch sessionState {
+            case .idle:
+                break
+            case .returnedToCase:
+                // 此前双耳入盒充电时已发过断开通知，链路断开后延迟归位至 idle，不重复发通知
+                scheduleReturnedToCaseIdleReset()
+            case .openedInCase, .wearing:
+                // 佩戴期间可能发生 GATT 省电断连或暂停音乐，启动 12 秒失联确认兜底而非立即断开
+                startDisconnectWatchdog()
+            }
         }
     }
 
-    /// 耳机连接事件处理：仅受 settings.notifyOnConnect 控制
-    private func triggerConnectPipeline() {
+    /// 处理新到达的电量报文（以双耳是否在盒充电作为核心物理判据）
+    private func evaluateSnapshotTransition(_ snapshot: FreeClipSnapshot, suppressAutoNotify: Bool) {
+        if pendingColdLaunchReconcile {
+            resolveColdLaunchWithSnapshot(snapshot, suppressAutoNotify: suppressAutoNotify)
+            return
+        }
+
+        switch sessionState {
+        case .idle:
+            if snapshot.anyBudOutOfCase {
+                cancelDisconnectWatchdog()
+                enterConnectedSession(
+                    targetState: .wearing,
+                    eventAt: snapshot.timestamp,
+                    reason: "检测到耳机离开充电盒",
+                    suppressNotify: suppressAutoNotify
+                )
+            } else if snapshot.lidState == .open {
+                cancelDisconnectWatchdog()
+                enterConnectedSession(
+                    targetState: .openedInCase,
+                    eventAt: snapshot.timestamp,
+                    reason: "检测到充电盒开盖",
+                    suppressNotify: suppressAutoNotify
+                )
+            }
+
+        case .openedInCase:
+            if snapshot.anyBudOutOfCase {
+                cancelDisconnectWatchdog()
+                updateSessionState(.wearing)
+                log("耳机已出盒佩戴，维持当前连接会话")
+            } else if snapshot.lidState == .closed {
+                cancelDisconnectWatchdog()
+                enterDisconnectedSession(
+                    targetState: .idle,
+                    eventAt: snapshot.timestamp,
+                    reason: "充电盒已合盖",
+                    suppressNotify: suppressAutoNotify
+                )
+            } else if isDeviceConnected {
+                touchSessionTimestamp()
+            }
+
+        case .wearing:
+            if snapshot.anyBudOutOfCase {
+                // 至少一只耳机仍在盒外（含单耳佩戴且另一只在盒合盖充电的场景），维持佩戴态绝不打扰
+                cancelDisconnectWatchdog()
+                touchSessionTimestamp()
+            } else if snapshot.allBudsInCaseCharging {
+                // 双耳均回到盒内开始充电：判定本次佩戴结束，立即推送一次断开通知
+                cancelDisconnectWatchdog()
+                let nextState: EarbudSessionState = (snapshot.lidState == .closed) ? .idle : .returnedToCase
+                enterDisconnectedSession(
+                    targetState: nextState,
+                    eventAt: snapshot.timestamp,
+                    reason: "双耳已放回充电盒开始充电",
+                    suppressNotify: suppressAutoNotify
+                )
+                if nextState == .returnedToCase && !isDeviceConnected {
+                    scheduleReturnedToCaseIdleReset()
+                }
+            }
+
+        case .returnedToCase:
+            if snapshot.anyBudOutOfCase {
+                // 用户未关盖又重新取出耳机佩戴，开启新一轮连接会话
+                cancelDisconnectWatchdog()
+                enterConnectedSession(
+                    targetState: .wearing,
+                    eventAt: snapshot.timestamp,
+                    reason: "耳机重新从充电盒取出",
+                    suppressNotify: suppressAutoNotify
+                )
+            } else if snapshot.lidState == .closed {
+                cancelDisconnectWatchdog()
+                updateSessionState(.idle)
+                log("充电盒已合盖，会话归位待机")
+            }
+        }
+    }
+
+    /// 冷启动历史会话对账（解决后台进程被系统回收后“仍在佩戴不重弹”与“早已归盒不卡死”的兼顾问题）
+    private func scheduleColdLaunchReconciliation() {
+        guard coldLaunchReconcileTask == nil else { return }
+        coldLaunchReconcileTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.coldLaunchReconcileTask = nil }
+
+            // 先给蓝牙上电与自动挂载最多 2.5 秒窗口
+            var probeTicks = 0
+            while probeTicks < 25 {
+                if Task.isCancelled || !self.pendingColdLaunchReconcile { return }
+                if self.isDeviceConnected { break }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                probeTicks += 1
+            }
+
+            guard !Task.isCancelled, self.pendingColdLaunchReconcile else { return }
+
+            if !self.isDeviceConnected {
+                // 设备完全未连接，说明进程挂起期间耳机早已收纳休眠，静默归位待机
+                self.pendingColdLaunchReconcile = false
+                self.updateSessionState(.idle)
+                self.log("清理历史未闭合会话，归位待机态")
+                return
+            }
+
+            // 设备当前已连接：主动拉取一次实时报文核对耳机是在耳上还是刚开盖在盒
+            self.sendFD21BatteryQuery()
+            var waitSnap = 0
+            while waitSnap < 18 {
+                if Task.isCancelled || !self.pendingColdLaunchReconcile { return }
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                waitSnap += 1
+            }
+
+            guard !Task.isCancelled, self.pendingColdLaunchReconcile else { return }
+            self.pendingColdLaunchReconcile = false
+
+            if self.initialAudioConnectedAtLaunch {
+                self.updateSessionState(.wearing)
+            } else {
+                self.enterConnectedSession(
+                    targetState: .openedInCase,
+                    eventAt: Date(),
+                    reason: "唤醒重连确认开启新会话",
+                    suppressNotify: self.pendingOneShotTriggerMode == .manual
+                )
+            }
+        }
+    }
+
+    private func resolveColdLaunchWithSnapshot(_ snapshot: FreeClipSnapshot, suppressAutoNotify: Bool) {
+        pendingColdLaunchReconcile = false
+        coldLaunchReconcileTask?.cancel()
+        coldLaunchReconcileTask = nil
+
+        if snapshot.anyBudOutOfCase {
+            // 耳机仍在耳朵上未充电，无缝延续佩戴态，不弹重复连接通知
+            updateSessionState(.wearing)
+            log("后台唤醒确认耳机仍在佩戴中，跳过重复通知")
+        } else if snapshot.lidState == .open || (snapshot.allBudsInCaseCharging && isDeviceConnected) {
+            // 双耳均在盒充电且当前刚开盖连接，按新开盖会话处理
+            enterConnectedSession(
+                targetState: .openedInCase,
+                eventAt: snapshot.timestamp,
+                reason: "检测到新开盖会话",
+                suppressNotify: suppressAutoNotify
+            )
+        } else {
+            updateSessionState(.idle)
+        }
+    }
+
+    /// 12 秒彻底失联兜底（应对“秒入盒秒关盖”未能抓到最后一帧充电广播的场景）
+    private func startDisconnectWatchdog() {
+        guard disconnectWatchdogTask == nil else { return }
+
+        // 先启动扫描，争取在入盒合盖后 1 秒内直接抓到 FDEE 充电广播立即触发断开
+        if centralManager.state == .poweredOn {
+            let isFg = (UIApplication.shared.applicationState == .active)
+            let services: [CBUUID]? = isFg ? nil : [fdeeUUID, fd21ServiceUUID, fd9aUUID]
+            centralManager.scanForPeripherals(
+                withServices: services,
+                options: [CBCentralManagerScanOptionAllowDuplicatesKey: isFg]
+            )
+        }
+
+        let totalTicks = Int(fullDisconnectTimeoutSeconds * 4) // 每 0.25s 检查一次，共 48 次 = 12s
+        let midProbeTick = totalTicks / 2
+
+        disconnectWatchdogTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            for tick in 0..<totalTicks {
+                if Task.isCancelled { return }
+                if self.isDeviceConnected || (self.sessionState != .wearing && self.sessionState != .openedInCase) {
+                    self.disconnectWatchdogTask = nil
+                    return
+                }
+                if tick == midProbeTick {
+                    self.isAudioConnected = Self.detectFreeClipAudioRoute().connected
+                    if self.isAudioConnected {
+                        self.disconnectWatchdogTask = nil
+                        return
+                    }
+                    self.attemptGattAttachIfConnected()
+                }
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
+
+            guard !Task.isCancelled else { return }
+            self.disconnectWatchdogTask = nil
+            self.isAudioConnected = Self.detectFreeClipAudioRoute().connected
+
+            guard !self.isDeviceConnected,
+                  (self.sessionState == .wearing || self.sessionState == .openedInCase) else {
+                return
+            }
+
+            self.enterDisconnectedSession(
+                targetState: .idle,
+                eventAt: Date(),
+                reason: "蓝牙与音频持续断开满 12 秒（合盖休眠兜底）",
+                suppressNotify: false
+            )
+        }
+    }
+
+    private func scheduleReturnedToCaseIdleReset() {
+        guard returnedIdleResetTask == nil else { return }
+        returnedIdleResetTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard let self, !Task.isCancelled else { return }
+            self.returnedIdleResetTask = nil
+            if !self.isDeviceConnected && self.sessionState == .returnedToCase {
+                self.updateSessionState(.idle)
+                self.log("归盒断联确认完成，会话归位待机")
+            }
+        }
+    }
+
+    private func enterConnectedSession(
+        targetState: EarbudSessionState,
+        eventAt: Date,
+        reason: String,
+        suppressNotify: Bool
+    ) {
+        disconnectTransitionTask?.cancel()
+        disconnectTransitionTask = nil
+        updateSessionState(targetState)
+        lastSessionConnectedAt = Date()
+        BatteryNotificationManager.shared.resetChannelCooldown(for: .connect)
+        log("进入连接会话[\(targetState.rawValue)]：\(reason)")
+
+        guard !suppressNotify else { return }
+        triggerConnectPipeline(since: eventAt)
+    }
+
+    private func enterDisconnectedSession(
+        targetState: EarbudSessionState,
+        eventAt: Date,
+        reason: String,
+        suppressNotify: Bool
+    ) {
+        connectTransitionTask?.cancel()
+        connectTransitionTask = nil
+        updateSessionState(targetState)
+        BatteryNotificationManager.shared.resetChannelCooldown(for: .disconnect)
+        log("结束连接会话[\(targetState.rawValue)]：\(reason)")
+
+        guard !suppressNotify else { return }
+        triggerDisconnectPipeline(since: eventAt)
+    }
+
+    /// 耳机连接通知流水线：仅受 settings.notifyOnConnect 控制
+    private func triggerConnectPipeline(since eventAt: Date) {
         connectTransitionTask?.cancel()
         let connectNotifyEnabled = settings.notifyOnConnect
+        let freshnessFloor = eventAt.addingTimeInterval(-0.5)
 
         connectTransitionTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            let connectedAt = Date()
 
-            // 主动查询一次最新电量（同时给 FD21 服务发现与 FDEE 广播留出最多 1.8 秒刷新窗口）
-            if self.centralManager.state == .poweredOn {
+            // 若尚未拿到刚到达的新鲜快照，主动查询一次并最多等待 1.8 秒
+            let alreadyFresh = (self.latestSnapshot?.timestamp ?? .distantPast) >= freshnessFloor
+            if !alreadyFresh && self.centralManager.state == .poweredOn {
                 if UIApplication.shared.applicationState == .active {
                     self.centralManager.scanForPeripherals(
                         withServices: nil,
@@ -168,22 +509,20 @@ final class FreeClipBluetoothManager: NSObject, ObservableObject {
                     )
                 }
                 self.sendFD21BatteryQuery()
-            }
 
-            // 等待最新快照到达（最多 1.8 秒，一旦收到新快照立即提前结束等待）
-            var waited = 0
-            while waited < 18 {
-                if Task.isCancelled { return }
-                if let snap = self.latestSnapshot, snap.timestamp >= connectedAt {
-                    break
+                var waited = 0
+                while waited < 18 {
+                    if Task.isCancelled { return }
+                    if let snap = self.latestSnapshot, snap.timestamp >= freshnessFloor {
+                        break
+                    }
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                    waited += 1
                 }
-                try? await Task.sleep(nanoseconds: 100_000_000)
-                waited += 1
             }
 
             guard !Task.isCancelled else { return }
 
-            // 重新读取实时开关状态，严格只检查 notifyOnConnect
             guard self.settings.notifyOnConnect && connectNotifyEnabled else {
                 self.log("连接推送已关闭，跳过连接通知")
                 return
@@ -194,6 +533,7 @@ final class FreeClipBluetoothManager: NSObject, ObservableObject {
                 await BatteryNotificationManager.shared.sendBatteryReport(
                     snap,
                     settings: self.settings,
+                    deviceName: self.discoveredDeviceName,
                     channel: .connect
                 )
             } else {
@@ -202,38 +542,38 @@ final class FreeClipBluetoothManager: NSObject, ObservableObject {
         }
     }
 
-    /// 耳机断开事件处理：仅受 settings.notifyOnDisconnect 控制
-    private func triggerDisconnectPipeline() {
+    /// 耳机断开/归盒通知流水线：仅受 settings.notifyOnDisconnect 控制
+    private func triggerDisconnectPipeline(since eventAt: Date) {
         disconnectTransitionTask?.cancel()
         let disconnectNotifyEnabled = settings.notifyOnDisconnect
+        let freshnessFloor = eventAt.addingTimeInterval(-0.5)
 
         disconnectTransitionTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            let disconnectedAt = Date()
 
-            // 耳机入盒瞬间往往伴随新的 FDEE 广播，短时等待最多 1.0 秒抓取入盒最新电量
-            if self.centralManager.state == .poweredOn {
+            // 若并非由最新归盒充电帧直接触发（如超时兜底），短时扫描最多 1.0 秒尝试补抓最新广播
+            let alreadyFresh = (self.latestSnapshot?.timestamp ?? .distantPast) >= freshnessFloor
+            if !alreadyFresh && self.centralManager.state == .poweredOn {
                 let isFg = (UIApplication.shared.applicationState == .active)
                 let services: [CBUUID]? = isFg ? nil : [self.fdeeUUID, self.fd21ServiceUUID, self.fd9aUUID]
                 self.centralManager.scanForPeripherals(
                     withServices: services,
                     options: [CBCentralManagerScanOptionAllowDuplicatesKey: isFg]
                 )
-            }
 
-            var waited = 0
-            while waited < 10 {
-                if Task.isCancelled { return }
-                if let snap = self.latestSnapshot, snap.timestamp >= disconnectedAt {
-                    break
+                var waited = 0
+                while waited < 10 {
+                    if Task.isCancelled { return }
+                    if let snap = self.latestSnapshot, snap.timestamp >= freshnessFloor {
+                        break
+                    }
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                    waited += 1
                 }
-                try? await Task.sleep(nanoseconds: 100_000_000)
-                waited += 1
             }
 
             guard !Task.isCancelled else { return }
 
-            // 重新读取实时开关状态，严格只检查 notifyOnDisconnect
             guard self.settings.notifyOnDisconnect && disconnectNotifyEnabled else {
                 self.log("断开推送已关闭，跳过断开通知")
                 return
@@ -352,7 +692,7 @@ final class FreeClipBluetoothManager: NSObject, ObservableObject {
         } else if peripheral.state == .connected && !isGattConnected {
             isGattConnected = true
             peripheral.discoverServices([fd21ServiceUUID])
-            evaluateConnectionTransition()
+            evaluateLinkStateChange()
         }
     }
 
@@ -375,7 +715,11 @@ final class FreeClipBluetoothManager: NSObject, ObservableObject {
     ) async -> OneShotScanOutcome {
         log("触发扫描：\(reason)")
 
-        let shouldNotify: Bool
+        let wasContinuousWearing = (sessionState == .wearing)
+            && !pendingColdLaunchReconcile
+            && Date().timeIntervalSince(lastSessionConnectedAt) > 12
+
+        var shouldNotify: Bool
         let channel: NotificationChannel
         switch triggerMode {
         case .manual:
@@ -406,6 +750,7 @@ final class FreeClipBluetoothManager: NSObject, ObservableObject {
 
         let result: FreeClipSnapshot? = await withCheckedContinuation { continuation in
             self.finishPendingScan(with: nil)
+            self.pendingOneShotTriggerMode = triggerMode
 
             self.pendingScanCompletion = { snapshot in
                 continuation.resume(returning: snapshot)
@@ -430,6 +775,32 @@ final class FreeClipBluetoothManager: NSObject, ObservableObject {
             }
         }
 
+        // 同步对齐快捷指令触发后的会话状态与防重复策略
+        switch triggerMode {
+        case .manual:
+            break
+        case .connectShortcut:
+            if wasContinuousWearing && result?.allBudsInCaseCharging != true {
+                log("当前处于持续佩戴会话中，跳过重复快捷指令连接通知")
+                shouldNotify = false
+            } else {
+                cancelDisconnectWatchdog()
+                if sessionState == .idle || sessionState == .returnedToCase {
+                    let target: EarbudSessionState = (result?.anyBudOutOfCase == true) ? .wearing : .openedInCase
+                    updateSessionState(target)
+                    lastSessionConnectedAt = Date()
+                    BatteryNotificationManager.shared.resetChannelCooldown(for: .connect)
+                }
+            }
+        case .disconnectShortcut:
+            cancelDisconnectWatchdog()
+            let target: EarbudSessionState = (isDeviceConnected && result?.lidState == .open) ? .returnedToCase : .idle
+            if sessionState != target {
+                updateSessionState(target)
+            }
+            BatteryNotificationManager.shared.resetChannelCooldown(for: .disconnect)
+        }
+
         var notifyResult: NotificationDeliveryResult? = nil
 
         if let fresh = result {
@@ -437,6 +808,7 @@ final class FreeClipBluetoothManager: NSObject, ObservableObject {
                 notifyResult = await BatteryNotificationManager.shared.sendBatteryReport(
                     fresh,
                     settings: settings,
+                    deviceName: discoveredDeviceName,
                     channel: channel
                 )
             }
@@ -452,6 +824,7 @@ final class FreeClipBluetoothManager: NSObject, ObservableObject {
                     notifyResult = await BatteryNotificationManager.shared.sendBatteryReport(
                         cached,
                         settings: settings,
+                        deviceName: discoveredDeviceName,
                         channel: channel
                     )
                 } else {
@@ -466,6 +839,7 @@ final class FreeClipBluetoothManager: NSObject, ObservableObject {
     private func finishPendingScan(with snapshot: FreeClipSnapshot?) {
         pendingScanTimer?.invalidate()
         pendingScanTimer = nil
+        pendingOneShotTriggerMode = nil
         if let completion = pendingScanCompletion {
             pendingScanCompletion = nil
             completion(snapshot)
@@ -522,6 +896,9 @@ final class FreeClipBluetoothManager: NSObject, ObservableObject {
             }
         }
 
+        // 驱动在盒充电 / 出盒佩戴状态机（单次扫描期间仅同步状态，由单次扫描统一负责通知投递）
+        evaluateSnapshotTransition(snapshot, suppressAutoNotify: isPendingOneShot)
+
         if isPendingOneShot {
             finishPendingScan(with: snapshot)
         }
@@ -541,10 +918,24 @@ extension FreeClipBluetoothManager: CBCentralManagerDelegate {
                     // 后台唤醒时同样挂载重连与后台服务扫描，确保连接/断开事件都能捕获
                     self.switchToBackgroundMode()
                 }
+                self.evaluateLinkStateChange()
             } else {
                 self.isScanning = false
                 self.isGattConnected = false
-                self.previousEffectiveConnected = self.isAudioConnected
+                self.isAudioConnected = false
+                self.cancelDisconnectWatchdog()
+                if central.state == .poweredOff {
+                    if self.sessionState == .wearing || self.sessionState == .openedInCase {
+                        self.enterDisconnectedSession(
+                            targetState: .idle,
+                            eventAt: Date(),
+                            reason: "系统蓝牙已关闭",
+                            suppressNotify: false
+                        )
+                    } else if self.sessionState == .returnedToCase {
+                        self.updateSessionState(.idle)
+                    }
+                }
             }
         }
     }
@@ -563,7 +954,7 @@ extension FreeClipBluetoothManager: CBCentralManagerDelegate {
                 } else if first.state != .connecting {
                     central.connect(first, options: nil)
                 }
-                self.evaluateConnectionTransition()
+                self.evaluateLinkStateChange()
             }
         }
     }
@@ -614,7 +1005,7 @@ extension FreeClipBluetoothManager: CBCentralManagerDelegate {
             }
             self.log("蓝牙 GATT 已连接")
             peripheral.discoverServices([self.fd21ServiceUUID])
-            self.evaluateConnectionTransition()
+            self.evaluateLinkStateChange()
         }
     }
 
@@ -625,11 +1016,11 @@ extension FreeClipBluetoothManager: CBCentralManagerDelegate {
             self.fd21WriteChar = nil
             self.log("蓝牙 GATT 已断开")
 
-            // 重新核对音频路由，避免系统在 GATT 断开同时音频也刚断开的竞态
+            // 重新核对音频路由，进入防抖/会话判定（佩戴期间短暂断连不会触发断开或重置连接）
             self.isAudioConnected = Self.detectFreeClipAudioRoute().connected
-            self.evaluateConnectionTransition()
+            self.evaluateLinkStateChange()
 
-            // 重新挂起自动连接监听，确保下次耳机出盒/开盖连上时系统后台立即唤醒 didConnect！
+            // 重新挂起自动连接监听，确保佩戴时重连以及下次开盖连上时系统后台立即唤醒 didConnect！
             self.reconnectSavedPeripheralIfPossible()
         }
     }

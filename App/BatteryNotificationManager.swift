@@ -75,16 +75,17 @@ final class BatteryNotificationManager: NSObject, UNUserNotificationCenterDelega
     func sendBatteryReport(
         _ snapshot: FreeClipSnapshot,
         settings: MonitorSettings,
+        deviceName: String? = nil,
         channel: NotificationChannel = .manual
     ) async -> NotificationDeliveryResult {
         let now = Date()
         switch channel {
         case .connect:
-            if let last = lastConnectSentAt, now.timeIntervalSince(last) < 6 {
+            if let last = lastConnectSentAt, now.timeIntervalSince(last) < 10 {
                 return .delivered
             }
         case .disconnect:
-            if let last = lastDisconnectSentAt, now.timeIntervalSince(last) < 6 {
+            if let last = lastDisconnectSentAt, now.timeIntervalSince(last) < 10 {
                 return .delivered
             }
         case .manual:
@@ -99,6 +100,19 @@ final class BatteryNotificationManager: NSObject, UNUserNotificationCenterDelega
         }
         content.body = snapshot.summaryLine
         content.sound = .default
+
+        // 仅「连接（开盖）推送」挂载原生 AirPods 风格电量卡片（自动跟随系统浅色/深色外观）
+        if channel == .connect {
+            let isDark = await AirPodsCardRenderer.resolveSystemDarkMode()
+            if let cardAttachment = AirPodsCardRenderer.makeConnectAttachment(
+                snapshot: snapshot,
+                deviceName: deviceName,
+                lowCaseThreshold: settings.lowBatteryThreshold,
+                isDarkMode: isDark
+            ) {
+                content.attachments = [cardAttachment]
+            }
+        }
 
         let idTag: String
         switch channel {

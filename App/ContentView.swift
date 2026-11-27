@@ -93,7 +93,7 @@ struct ContentView: View {
 
     private var statusDotColor: Color {
         if bt.bluetoothState != .poweredOn { return .red }
-        if bt.isDeviceConnected { return .green }
+        if bt.isSessionActiveForUI { return .green }
         if bt.isScanning { return .blue }
         return .gray
     }
@@ -103,7 +103,7 @@ struct ContentView: View {
         case .poweredOff: return "蓝牙未开启"
         case .unauthorized: return "需要蓝牙权限"
         case .poweredOn:
-            if bt.isDeviceConnected { return "已连接" }
+            if bt.isSessionActiveForUI { return "已连接" }
             if bt.isScanning { return "正在扫描" }
             return "已暂停"
         default:
@@ -373,6 +373,7 @@ private struct DiagnosticsSheetView: View {
                 Section("状态") {
                     LabeledContent("App Group", value: SharedBatteryStore.shared.resolvedAppGroupID ?? "不可用")
                     LabeledContent("通知权限", value: notificationStatusText)
+                    LabeledContent("会话状态", value: bt.sessionState.rawValue)
                     if let snap = bt.latestSnapshot {
                         LabeledContent("数据通道", value: snap.source.rawValue)
                     }

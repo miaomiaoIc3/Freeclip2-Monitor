@@ -7,6 +7,24 @@ enum LidState: String, Codable {
     case unknown = "未知"
 }
 
+/// 耳机使用会话状态（持久化存储，用于 AirPods 式开盖/佩戴/归盒通知判定与防抖）
+enum EarbudSessionState: String, Codable {
+    /// 待机态：耳机在盒合盖或未连接手机
+    case idle = "待机"
+    /// 已开盖或已连上手机（已触发本次会话连接推送），但尚未观测到耳机离开充电触点
+    case openedInCase = "开盖在盒"
+    /// 佩戴使用中（至少一只耳机已离开充电触点 isCharging == false）
+    case wearing = "佩戴中"
+    /// 佩戴结束后双耳已全部放回盒内充电（已触发本次会话断开推送），等待合盖或断联归位待机
+    case returnedToCase = "已归盒充电"
+}
+
+/// 持久化的耳机使用会话记录
+struct PersistedSessionRecord: Codable, Equatable {
+    var state: EarbudSessionState
+    var updatedAt: Date
+}
+
 /// 数据来源通道
 enum TelemetrySource: String, Codable {
     case fdeeBroadcast = "FDEE 广播"
@@ -18,6 +36,16 @@ struct BatteryUnit: Codable, Equatable {
     /// 0~100；nil 表示当前未上报（例如单耳不在盒内）
     let level: Int?
     let isCharging: Bool
+
+    /// 电量有效且未处于充电态（已离开充电盒触点，处于盒外/佩戴态）
+    var isOutOfCase: Bool {
+        level != nil && !isCharging
+    }
+
+    /// 电量有效且处于充电态（位于充电盒内接触触点）
+    var isInCaseCharging: Bool {
+        level != nil && isCharging
+    }
 
     var displayText: String {
         guard let level else { return "--" }
@@ -39,6 +67,51 @@ struct FreeClipSnapshot: Codable, Equatable {
     let source: TelemetrySource
     let timestamp: Date
     let rawHex: String
+    /// 当前报文是否携带可靠的双耳充电状态位（FDEE 帧及含 Tag 0x03 的 FD21 帧为 true）
+    let hasBudChargingTelemetry: Bool
+
+    init(
+        caseBattery: BatteryUnit,
+        earbud1: BatteryUnit,
+        earbud2: BatteryUnit,
+        lidState: LidState,
+        source: TelemetrySource,
+        timestamp: Date,
+        rawHex: String,
+        hasBudChargingTelemetry: Bool = true
+    ) {
+        self.caseBattery = caseBattery
+        self.earbud1 = earbud1
+        self.earbud2 = earbud2
+        self.lidState = lidState
+        self.source = source
+        self.timestamp = timestamp
+        self.rawHex = rawHex
+        self.hasBudChargingTelemetry = hasBudChargingTelemetry
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case caseBattery
+        case earbud1
+        case earbud2
+        case lidState
+        case source
+        case timestamp
+        case rawHex
+        case hasBudChargingTelemetry
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.caseBattery = try c.decode(BatteryUnit.self, forKey: .caseBattery)
+        self.earbud1 = try c.decode(BatteryUnit.self, forKey: .earbud1)
+        self.earbud2 = try c.decode(BatteryUnit.self, forKey: .earbud2)
+        self.lidState = try c.decode(LidState.self, forKey: .lidState)
+        self.source = try c.decode(TelemetrySource.self, forKey: .source)
+        self.timestamp = try c.decode(Date.self, forKey: .timestamp)
+        self.rawHex = try c.decode(String.self, forKey: .rawHex)
+        self.hasBudChargingTelemetry = try c.decodeIfPresent(Bool.self, forKey: .hasBudChargingTelemetry) ?? true
+    }
 
     /// 摘要文案（用于通知与快捷指令返回值）
     var summaryLine: String {
@@ -46,6 +119,18 @@ struct FreeClipSnapshot: Codable, Equatable {
             ? "\(caseBattery.shortPercent)⚡"
             : caseBattery.shortPercent
         return "充电盒 \(caseText) · 左耳 \(earbud1.shortPercent) · 右耳 \(earbud2.shortPercent)"
+    }
+
+    /// 至少一只耳机已离开充电盒触点（处于佩戴/盒外使用状态）
+    var anyBudOutOfCase: Bool {
+        guard hasBudChargingTelemetry else { return false }
+        return earbud1.isOutOfCase || earbud2.isOutOfCase
+    }
+
+    /// 双耳均已上报有效电量且均在盒内充电（全部归盒状态）
+    var allBudsInCaseCharging: Bool {
+        guard hasBudChargingTelemetry else { return false }
+        return earbud1.isInCaseCharging && earbud2.isInCaseCharging
     }
 
     /// 电量、充电或盒盖状态是否相对上次有实质变化
@@ -201,10 +286,10 @@ enum FreeClipProtocol {
     }
 
     private static func decodeBatteryByte(_ byte: UInt8) -> BatteryUnit {
-        let isCharging = (byte & 0x80) != 0
         let rawLevel = Int(byte & 0x7F)
-        // 华为协议中 0x7F (127) 或 >100 表示设备不在盒/未上报
+        // 华为协议中 0x7F (127) 或 >100 表示设备不在盒/未上报；仅有效电量时最高位才代表在盒充电
         let level: Int? = (rawLevel <= 100) ? rawLevel : nil
+        let isCharging = (level != nil) && ((byte & 0x80) != 0)
         return BatteryUnit(level: level, isCharging: isCharging)
     }
 
@@ -264,9 +349,10 @@ enum FreeClipProtocol {
             let rightLvl: Int? = levels[1] <= 100 ? Int(levels[1]) : nil
             let caseLvl: Int? = levels[2] <= 100 ? Int(levels[2]) : nil
 
-            let leftChg = (charging != nil && charging!.count >= 1) ? charging![0] != 0 : false
-            let rightChg = (charging != nil && charging!.count >= 2) ? charging![1] != 0 : false
-            let caseChg = (charging != nil && charging!.count >= 3) ? charging![2] != 0 : false
+            let hasBudChg = (charging != nil && charging!.count >= 2)
+            let leftChg = (leftLvl != nil && charging != nil && charging!.count >= 1) ? charging![0] != 0 : false
+            let rightChg = (rightLvl != nil && charging != nil && charging!.count >= 2) ? charging![1] != 0 : false
+            let caseChg = (caseLvl != nil && charging != nil && charging!.count >= 3) ? charging![2] != 0 : false
 
             return FreeClipSnapshot(
                 caseBattery: BatteryUnit(level: caseLvl, isCharging: caseChg),
@@ -275,7 +361,8 @@ enum FreeClipProtocol {
                 lidState: .unknown,
                 source: .fd21Gatt,
                 timestamp: now,
-                rawHex: data.hexString
+                rawHex: data.hexString,
+                hasBudChargingTelemetry: hasBudChg
             )
         }
 
@@ -288,7 +375,8 @@ enum FreeClipProtocol {
                 lidState: .unknown,
                 source: .fd21Gatt,
                 timestamp: now,
-                rawHex: data.hexString
+                rawHex: data.hexString,
+                hasBudChargingTelemetry: false
             )
         }
 

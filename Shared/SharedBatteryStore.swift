@@ -10,6 +10,7 @@ final class SharedBatteryStore {
     static let defaultAppGroupID = "group.com.freeclip.monitor"
     private let snapshotKey = "freeclip_latest_snapshot_v1"
     private let settingsKey = "freeclip_monitor_settings_v1"
+    private let sessionKey = "freeclip_earbud_session_v1"
     private let logsKey = "freeclip_debug_logs_v1"
     private let snapshotFilename = "freeclip_latest_snapshot_v1.json"
 
@@ -164,6 +165,25 @@ final class SharedBatteryStore {
             return settings
         }
         return MonitorSettings()
+    }
+
+    func saveSessionRecord(_ record: PersistedSessionRecord) {
+        if let data = try? JSONEncoder().encode(record) {
+            defaults.set(data, forKey: sessionKey)
+            UserDefaults.standard.set(data, forKey: sessionKey)
+        }
+    }
+
+    func loadSessionRecord() -> PersistedSessionRecord {
+        if let data = defaults.data(forKey: sessionKey),
+           let record = try? JSONDecoder().decode(PersistedSessionRecord.self, from: data) {
+            return record
+        }
+        if let data = UserDefaults.standard.data(forKey: sessionKey),
+           let record = try? JSONDecoder().decode(PersistedSessionRecord.self, from: data) {
+            return record
+        }
+        return PersistedSessionRecord(state: .idle, updatedAt: .distantPast)
     }
 
     func appendLog(_ message: String) {
