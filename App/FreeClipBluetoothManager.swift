@@ -533,7 +533,6 @@ final class FreeClipBluetoothManager: NSObject, ObservableObject {
                 await BatteryNotificationManager.shared.sendBatteryReport(
                     snap,
                     settings: self.settings,
-                    deviceName: self.discoveredDeviceName,
                     channel: .connect
                 )
             } else {
@@ -808,7 +807,6 @@ final class FreeClipBluetoothManager: NSObject, ObservableObject {
                 notifyResult = await BatteryNotificationManager.shared.sendBatteryReport(
                     fresh,
                     settings: settings,
-                    deviceName: discoveredDeviceName,
                     channel: channel
                 )
             }
@@ -824,7 +822,6 @@ final class FreeClipBluetoothManager: NSObject, ObservableObject {
                     notifyResult = await BatteryNotificationManager.shared.sendBatteryReport(
                         cached,
                         settings: settings,
-                        deviceName: discoveredDeviceName,
                         channel: channel
                     )
                 } else {
