@@ -13,11 +13,20 @@
       "bundleIdentifier": "com.freeclip.monitor",
       "developerName": "Happenstance",
       "subtitle": "查看充电盒与双耳电量",
-      "localizedDescription": "在 iPhone 上查看华为 FreeClip 2 充电盒与双耳电量。\n\n- 支持开盖、合盖及充电状态下的电量读取\n- 提供桌面小号、中号及锁屏小组件\n- 支持蓝牙断开、低电量与充满通知\n- 内置快捷指令动作，可配合自动化自动刷新\n\n仅在本地读取蓝牙广播，不联网，不收集任何数据。需要 iOS 17.0 及以上，安装时请保留 App Extensions 以启用小组件。",
+      "localizedDescription": "在 iPhone 上查看华为 FreeClip 2 充电盒与双耳电量。\n\n- 支持开盖、合盖及充电状态下的电量读取\n- 提供桌面小号、中号及锁屏小组件\n- 支持蓝牙连接、断开、低电量与充满通知\n- 内置快捷指令动作，可配合自动化自动刷新\n\n仅在本地读取蓝牙广播，不联网，不收集任何数据。需要 iOS 17.0 及以上，安装时请保留 App Extensions 以启用小组件。",
       "iconURL": "https://raw.githubusercontent.com/miaomiaoIc3/Freeclip2-Monitor/main/App/Assets.xcassets/AppIcon.appiconset/AppIcon.png",
       "tintColor": "#30D158",
       "category": "utilities",
       "versions": [
+        {
+          "version": "0.9.2",
+          "buildVersion": "3",
+          "date": "2026-11-27T06:15:57Z",
+          "localizedDescription": "重构连接与断开通知为「在盒充电 / 出盒佩戴」四态会话状态机（开盖即推一次电量、持续佩戴全程免打扰不重弹、双耳归盒充电自动推送断开电量）；新增浅色 / 深色 / 色调自适应桌面图标。",
+          "downloadURL": "https://github.com/miaomiaoIc3/Freeclip2-Monitor/releases/download/v0.9.2/FreeClipMonitor-v0.9.2.ipa",
+          "size": 2750457,
+          "minOSVersion": "17.0"
+        },
         {
           "version": "0.9.1",
           "buildVersion": "2",

@@ -4,7 +4,7 @@
 
 在 iPhone 上用华为 FreeClip 2 时，系统自带的电池组件看不到充电盒电量，官方 App 又需要每次手动打开。这个项目是写给自己的小工具，用来直接通过蓝牙读取充电盒和双耳电量，并同步到桌面小组件和系统通知里。
 
-目前处于 `v0.9.1` 公开测试阶段，仍在持续维护，遇到问题欢迎提 Issue。
+目前处于 `v0.9.2` 公开测试阶段，仍在持续维护，遇到问题欢迎提 Issue。
 
 ## 功能
 
@@ -62,7 +62,7 @@
 
 ### 方式二：直接下载 `.ipa` 安装
 
-在 [Releases 页面](https://github.com/miaomiaoIc3/Freeclip2-Monitor/releases/latest) 下载 `FreeClipMonitor-v0.9.1.ipa`，导入 SideStore / Feather / 轻松签 / TrollStore / Sideloadly 安装即可。
+在 [Releases 页面](https://github.com/miaomiaoIc3/Freeclip2-Monitor/releases/latest) 下载 `FreeClipMonitor-v0.9.2.ipa`，导入 SideStore / Feather / 轻松签 / TrollStore / Sideloadly 安装即可。
 
 > 若覆盖更新后桌面或通知横幅仍显示空白网格图标，重启一次 iPhone 清理系统图标缓存即可。
 
